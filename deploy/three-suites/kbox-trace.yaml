@@ -1,0 +1,116 @@
+# A temporary pod for the loopback-connect investigation: the same
+#
+# unprivileged configuration with the network bridge trace enabled.
+# The long suites keep the other three daemons busy, so a race that needs a
+# trace gets its own pod instead of sharing one.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbox-trace
+  namespace: kbox-three-suites
+  labels:
+    app: kbox-trace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kbox-trace
+  template:
+    metadata:
+      labels:
+        app: kbox-trace
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kboxd
+          image: kbox-python/kbox:v156
+          imagePullPolicy: IfNotPresent
+          args:
+            - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=4096M loglevel=4" 2>>/data/kboxd.log
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: Unconfined
+          env:
+            - name: HOME
+              value: /dev/shm
+            # The probe daemon carries the network bridge trace. It names every
+            # socket the bridge retires and the bytes that retire with it, so a
+            # transfer that loses its tail can be told apart from a peer that
+            # closed on purpose.
+            - name: KBOX_NET_TRACE
+              value: "1"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /data
+            - name: run
+              mountPath: /run/kbox
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 12Gi
+        - name: shim
+          image: kbox-python/kbox:v156
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOME
+              value: /dev/shm
+          command:
+            - /usr/bin/python3
+            - /usr/local/bin/kbox-dockerd.py
+            - --kbox-sock
+            - /run/kbox/kboxd.sock
+            - --config
+            - /etc/kbox/kbox-config.yaml
+            - --listen
+            - 0.0.0.0:2376
+            - --state-dir
+            - /data/kbox-dockerd
+            - -v
+          ports:
+            - name: docker-api
+              containerPort: 2376
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: run
+              mountPath: /run/kbox
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: kbox-config
+        - name: state
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+        - name: data
+          emptyDir:
+            sizeLimit: 24Gi
+        - name: run
+          emptyDir: {}

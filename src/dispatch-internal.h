@@ -1,0 +1,729 @@
+/* SPDX-License-Identifier: MIT */
+
+#ifndef KBOX_DISPATCH_INTERNAL_H
+#define KBOX_DISPATCH_INTERNAL_H
+
+/* Internal header for the seccomp dispatch subsystem. Exposes shared helpers
+ * from seccomp-dispatch.c so that handler functions extracted into separate
+ * translation units (dispatch-net.c, dispatch-id.c, dispatch-exec.c,
+ * dispatch-misc.c) can call them.
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "fd-table.h"
+#include "lkl-wrap.h"
+#include "seccomp.h"
+
+/* Sentinel values for the host_fd field in kbox_fd_entry.
+ *
+ * KBOX_FD_HOST_SAME_FD_SHADOW: host_fd is a same-fd shadow (memfd injected
+ *     at the tracee's FD number via SECCOMP_IOCTL_NOTIF_ADDFD).
+ * KBOX_FD_LOCAL_ONLY_SHADOW: host_fd is a local-only shadow (supervisor
+ *     holds the memfd; trap/rewrite mode, no tracee injection).
+ *
+ * KBOX_LKL_FD_SHADOW_ONLY (lkl_fd sentinel) is defined in fd-table.h.
+ */
+#define KBOX_FD_HOST_SAME_FD_SHADOW (-2)
+#define KBOX_FD_LOCAL_ONLY_SHADOW (-3)
+
+/* Per-thread scratch buffer for I/O dispatch. Each seccomp supervisor thread
+ * is non-reentrant: only one syscall is dispatched per thread at a time.
+ */
+extern __thread uint8_t dispatch_scratch[KBOX_IO_CHUNK_LEN];
+
+/* Argument extraction helpers. */
+
+static inline int64_t to_c_long_arg(uint64_t v)
+{
+    return (int64_t) v;
+}
+
+/* Sign-extend a 32-bit dirfd argument. seccomp_data.args[] zero-extends 32-bit
+ * values, so AT_FDCWD (-100) arrives as 0xFFFFFF9C. This helper restores the
+ * sign.
+ */
+static inline long to_dirfd_arg(uint64_t v)
+{
+    return (long) (int) (uint32_t) v;
+}
+
+/* Return nonzero if req was delivered via SIGSYS trap or syscall rewrite rather
+ * than the seccomp user-notification path.
+ */
+static inline int request_uses_trap_signals(
+    const struct kbox_syscall_request *req)
+{
+    return req && (req->source == KBOX_SYSCALL_SOURCE_TRAP ||
+                   req->source == KBOX_SYSCALL_SOURCE_REWRITE);
+}
+
+/* Return 1 if an FD-based I/O syscall should fail with EBADF rather than
+ * CONTINUE for a not-in-table FD.  Only tracked FDs (lkl_fd >= 0 for LKL
+ * files, KBOX_LKL_FD_SHADOW_ONLY for host-passthrough pipes/eventfds/proc
+ * opens) are allowed.  All untracked FDs (lkl_fd == -1) are denied to block
+ * I/O on host FDs leaked via the openat TOCTOU race.
+ */
+static inline int fd_should_deny_io(long fd, long lkl_fd)
+{
+    (void) fd;
+    if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY || lkl_fd >= 0)
+        return 0;
+    return 1;
+}
+
+/* The tracee being dispatched on this thread, for adopting fds the supervisor
+ * did not create. */
+extern __thread pid_t kbox_cur_tracee_pid;
+
+/* An fd that arrived by SCM_RIGHTS (Chromium's shared memory and pipes between
+ * its processes) never passed through the supervisor, so the table does not
+ * know it. If /proc shows it is an anonymous kernel object, track it as a host
+ * passthrough fd. A host path file stays denied: that is the leak this policy
+ * exists to stop. */
+int kbox_fd_adopt_host_object(struct kbox_fd_table *t, pid_t pid, long fd);
+
+static inline int fd_should_deny_io_ctx(struct kbox_fd_table *t,
+                                        long fd,
+                                        long lkl_fd)
+{
+    if (!fd_should_deny_io(fd, lkl_fd))
+        return 0;
+    if (t && kbox_fd_table_find_by_host_fd(t, fd) >= 0)
+        return 0;
+    if (t && fd >= 0 && fd < KBOX_FD_BASE &&
+        kbox_fd_adopt_host_object(t, kbox_cur_tracee_pid, fd))
+        return 0;
+    return 1;
+}
+
+/* Does the tracee really hold this descriptor open? The supervisor tracks the
+ * FDs it created, but a number can also arrive that it never created and that
+ * the process never opened. Answering fcntl(F_GETFL) with a made-up success
+ * for such a number hides EBADF: CPython's os.get_blocking() and
+ * os.set_blocking() probe a closed descriptor and must see the error.
+ */
+static inline int tracee_fd_is_open(pid_t pid, long fd)
+{
+    char path[64];
+    char target[8];
+    int n;
+
+    if (fd < 0 || fd > (1 << 24))
+        return 0;
+    n = snprintf(path, sizeof(path), "/proc/%d/fd/%ld", (int) pid, fd);
+    if (n < 0 || (size_t) n >= sizeof(path))
+        return 0;
+    return readlink(path, target, sizeof(target)) >= 0;
+}
+
+/* Descriptor policy for I/O handlers, including sockets the kernel owns.
+ *
+ * fd_should_deny_io_ctx() refuses every descriptor the supervisor did not
+ * create. That is right for leaked host files (the openat TOCTOU window), but
+ * wrong for sockets: an AF_UNIX connection accepted by a host listener, or a
+ * socket inherited from the runtime, is a real descriptor the tracee holds and
+ * the host kernel created. Refusing read(2) on it made an accepted connection
+ * unusable -- CPython's ssl wraps the accepted socket and the first record read
+ * came back EBADF. A descriptor that is not a socket still keeps the strict
+ * answer, so the leak protection is unchanged.
+ */
+static inline int tracee_fd_is_socket(pid_t pid, long fd)
+{
+    char path[64];
+    char target[64];
+    int n;
+    ssize_t len;
+
+    if (fd < 0 || fd > (1 << 24))
+        return 0;
+    n = snprintf(path, sizeof(path), "/proc/%d/fd/%ld", (int) pid, fd);
+    if (n < 0 || (size_t) n >= sizeof(path))
+        return 0;
+    len = readlink(path, target, sizeof(target) - 1);
+    if (len <= 0)
+        return 0;
+    target[len] = '\0';
+    return strncmp(target, "socket:[", 8) == 0;
+}
+
+static inline int io_should_deny_fd(struct kbox_supervisor_ctx *ctx,
+                                    const struct kbox_syscall_request *req,
+                                    long fd,
+                                    long lkl_fd)
+{
+    pid_t pid = kbox_syscall_request_pid(req);
+
+    if (!fd_should_deny_io(fd, lkl_fd))
+        return 0;
+    if (ctx && ctx->fd_table &&
+        kbox_fd_table_find_by_host_fd(ctx->fd_table, fd) >= 0)
+        return 0;
+
+    /* A descriptor the tracee really holds open is the guest's own, even when
+     * the supervisor never created it. kbox learns about most FDs at open(2)
+     * time, but two paths install descriptors behind its back: an accepted
+     * connection, and any descriptor received over SCM_RIGHTS.
+     * multiprocessing's forkserver gets the client's pipe that way, then writes
+     * the child pid into it; the strict answer was EBADF, so every
+     * ProcessPoolExecutor, every forkserver Pool and test_compileall's worker
+     * test failed.
+     *
+     * The leak this rule guards against is a *number* the guest guesses: a
+     * supervisor FD is not open in the tracee process, so /proc/<pid>/fd/<n>
+     * does not resolve and the answer stays EBADF.
+     */
+    return !tracee_fd_is_open(pid, fd);
+}
+
+static inline void track_host_passthrough_fd(struct kbox_fd_table *t, int fd)
+{
+    if (kbox_fd_table_insert_at(t, fd, KBOX_LKL_FD_SHADOW_ONLY, 0) < 0)
+        fprintf(stderr, "kbox: warning: host-passthrough FD %d untrackable\n",
+                fd);
+}
+
+/* Look up the FD table entry for a guest FD. Returns NULL if fd is out of
+ * range or t is NULL.
+ */
+static inline struct kbox_fd_entry *fd_table_entry(struct kbox_fd_table *t,
+                                                   long fd)
+{
+    if (!t || fd < 0 || fd >= KBOX_FD_TABLE_CAPACITY)
+        return NULL;
+    return &t->slots[fd];
+}
+
+/* Evict an LKL FD from the stat cache so stale fstat results are never
+ * returned after the FD is closed and its number reused.
+ */
+static inline void invalidate_stat_cache_fd(struct kbox_supervisor_ctx *ctx,
+                                            long lkl_fd)
+{
+#if KBOX_STAT_CACHE_ENABLED
+    for (int i = 0; i < KBOX_STAT_CACHE_MAX; i++)
+        if (ctx->stat_cache[i].lkl_fd == lkl_fd)
+            ctx->stat_cache[i].lkl_fd = -1;
+#else
+    (void) ctx;
+    (void) lkl_fd;
+#endif
+}
+
+/* Close an LKL FD and evict it from the stat cache. Every LKL close in the
+ * dispatch code should go through this wrapper to prevent stale fstat results
+ * when the LKL FD number is reused.
+ */
+static inline long lkl_close_and_invalidate(struct kbox_supervisor_ctx *ctx,
+                                            long lkl_fd)
+{
+    invalidate_stat_cache_fd(ctx, lkl_fd);
+    /* A writeback that was abandoned still has a thread inside an LKL call on
+     * this descriptor. Closing it would let the number be reused by another
+     * file while that call is in flight, so the number is retired instead. */
+    if (kbox_lkl_fd_is_abandoned(lkl_fd))
+        return 0;
+    return kbox_lkl_close(ctx->sysnrs, lkl_fd);
+}
+
+/* Open-flag ABI translation (aarch64 host <-> asm-generic LKL).
+ *
+ * aarch64 and asm-generic define four O_* flags differently:
+ *
+ *   Flag         aarch64     asm-generic (LKL)
+ *   O_DIRECTORY  0x04000     0x10000
+ *   O_NOFOLLOW   0x08000     0x20000
+ *   O_DIRECT     0x10000     0x04000
+ *   O_LARGEFILE  0x20000     0x08000
+ *
+ * x86_64 values already match asm-generic so no translation is needed.
+ */
+#if defined(__aarch64__)
+
+#define HOST_O_DIRECTORY 0x04000
+#define HOST_O_NOFOLLOW 0x08000
+#define HOST_O_DIRECT 0x10000
+#define HOST_O_LARGEFILE 0x20000
+
+#define LKL_O_DIRECTORY 0x10000
+#define LKL_O_NOFOLLOW 0x20000
+#define LKL_O_DIRECT 0x04000
+#define LKL_O_LARGEFILE 0x08000
+
+static inline long host_to_lkl_open_flags(long flags)
+{
+    long out = flags & ~(HOST_O_DIRECTORY | HOST_O_NOFOLLOW | HOST_O_DIRECT |
+                         HOST_O_LARGEFILE);
+    if (flags & HOST_O_DIRECTORY)
+        out |= LKL_O_DIRECTORY;
+    if (flags & HOST_O_NOFOLLOW)
+        out |= LKL_O_NOFOLLOW;
+    if (flags & HOST_O_DIRECT)
+        out |= LKL_O_DIRECT;
+    if (flags & HOST_O_LARGEFILE)
+        out |= LKL_O_LARGEFILE;
+    return out;
+}
+
+static inline long lkl_to_host_open_flags(long flags)
+{
+    long out = flags & ~(LKL_O_DIRECTORY | LKL_O_NOFOLLOW | LKL_O_DIRECT |
+                         LKL_O_LARGEFILE);
+    if (flags & LKL_O_DIRECTORY)
+        out |= HOST_O_DIRECTORY;
+    if (flags & LKL_O_NOFOLLOW)
+        out |= HOST_O_NOFOLLOW;
+    if (flags & LKL_O_DIRECT)
+        out |= HOST_O_DIRECT;
+    if (flags & LKL_O_LARGEFILE)
+        out |= HOST_O_LARGEFILE;
+    return out;
+}
+
+#else /* x86_64: flags already match asm-generic */
+
+static inline long host_to_lkl_open_flags(long flags)
+{
+    return flags;
+}
+
+static inline long lkl_to_host_open_flags(long flags)
+{
+    return flags;
+}
+
+#endif
+
+/* Guest memory access. */
+
+int guest_mem_read(const struct kbox_supervisor_ctx *ctx,
+                   pid_t pid,
+                   uint64_t remote_addr,
+                   void *out,
+                   size_t len);
+int guest_mem_write(const struct kbox_supervisor_ctx *ctx,
+                    pid_t pid,
+                    uint64_t remote_addr,
+                    const void *in,
+                    size_t len);
+int guest_mem_write_force(const struct kbox_supervisor_ctx *ctx,
+                          pid_t pid,
+                          uint64_t remote_addr,
+                          const void *in,
+                          size_t len);
+int guest_mem_read_string(const struct kbox_supervisor_ctx *ctx,
+                          pid_t pid,
+                          uint64_t remote_addr,
+                          char *buf,
+                          size_t max_len);
+int guest_mem_read_open_how(const struct kbox_supervisor_ctx *ctx,
+                            pid_t pid,
+                            uint64_t remote_addr,
+                            uint64_t size,
+                            struct kbox_open_how *out);
+int guest_mem_write_small_metadata(const struct kbox_supervisor_ctx *ctx,
+                                   pid_t pid,
+                                   uint64_t remote_addr,
+                                   const void *in,
+                                   size_t len);
+int read_guest_string(const struct kbox_supervisor_ctx *ctx,
+                      pid_t pid,
+                      uint64_t addr,
+                      char *buf,
+                      size_t size);
+
+/* Guest FIFO twins: remove the ones a container left behind when its
+ * supervised process exits. */
+void fifo_twin_cleanup(pid_t container_pid);
+
+/* FD injection into the tracee. */
+
+int request_addfd(const struct kbox_supervisor_ctx *ctx,
+                  const struct kbox_syscall_request *req,
+                  int srcfd,
+                  uint32_t newfd_flags);
+int request_addfd_at(const struct kbox_supervisor_ctx *ctx,
+                     const struct kbox_syscall_request *req,
+                     int srcfd,
+                     int target_fd,
+                     uint32_t newfd_flags);
+/* Install srcfd at the lowest free number in the host-passthrough band
+ * [KBOX_FD_PIPE_BASE, KBOX_FD_PIPE_TOP) so the kernel can close it itself, and
+ * fall back to the lowest free number when the band is full or the kernel does
+ * not support ADDFD at a chosen descriptor. */
+int request_addfd_passthrough(const struct kbox_supervisor_ctx *ctx,
+                              const struct kbox_syscall_request *req,
+                              int srcfd,
+                              uint32_t newfd_flags);
+
+/* Path resolution and translation. */
+
+long resolve_open_dirfd(const char *path,
+                        long dirfd,
+                        const struct kbox_fd_table *table);
+int translate_guest_path(const struct kbox_supervisor_ctx *ctx,
+                         pid_t pid,
+                         uint64_t addr,
+                         const char *host_root,
+                         char *translated,
+                         size_t size);
+int translate_request_path(const struct kbox_syscall_request *req,
+                           const struct kbox_supervisor_ctx *ctx,
+                           size_t path_idx,
+                           const char *host_root,
+                           char *translated,
+                           size_t size);
+int translate_request_at_path(const struct kbox_syscall_request *req,
+                              struct kbox_supervisor_ctx *ctx,
+                              size_t dirfd_idx,
+                              size_t path_idx,
+                              char *translated,
+                              size_t size,
+                              long *lkl_dirfd);
+int should_continue_for_dirfd(long lkl_dirfd);
+int open_host_dirfd_for_dispatch(pid_t pid,
+                                 long raw_dirfd,
+                                 long lkl_dirfd,
+                                 int *sv_dirfd_out,
+                                 int *close_out);
+int host_bind_is_readonly(const struct kbox_supervisor_ctx *ctx,
+                          pid_t pid,
+                          long raw_dirfd,
+                          long lkl_dirfd);
+int guest_addr_is_writable(pid_t pid, uint64_t addr);
+int guest_range_has_shared_file_write_mapping(pid_t pid,
+                                              uint64_t addr,
+                                              uint64_t len);
+int dup_tracee_fd(pid_t pid, int tracee_fd);
+int kbox_path_is_host_passthrough(const struct kbox_supervisor_ctx *ctx,
+                                  const struct kbox_syscall_request *req,
+                                  size_t path_idx,
+                                  const char *translated);
+
+void translate_proc_self(const char *path,
+                         pid_t pid,
+                         char *sv_path,
+                         size_t sv_path_len);
+
+/* FD utilities. */
+
+int child_fd_is_open(const struct kbox_supervisor_ctx *ctx, long fd);
+long allocate_passthrough_hostonly_fd(struct kbox_supervisor_ctx *ctx);
+long next_hostonly_fd_hint(const struct kbox_supervisor_ctx *ctx);
+int ensure_proc_self_fd_dir(struct kbox_supervisor_ctx *ctx);
+int ensure_proc_mem_fd(struct kbox_supervisor_ctx *ctx);
+
+/* Stat ABI conversion. */
+
+void kbox_lkl_stat_to_host(const struct kbox_lkl_stat *src, struct stat *dst);
+void normalize_host_stat_if_needed(struct kbox_supervisor_ctx *ctx,
+                                   const char *path,
+                                   struct stat *host_stat);
+void normalize_statx_if_needed(struct kbox_supervisor_ctx *ctx,
+                               const char *path,
+                               uint8_t *statx_buf);
+
+/* Shadow FD management. */
+
+int ensure_same_fd_shadow(struct kbox_supervisor_ctx *ctx,
+                          const struct kbox_syscall_request *req,
+                          long fd,
+                          long lkl_fd);
+int try_cached_shadow_open_dispatch(struct kbox_supervisor_ctx *ctx,
+                                    const struct kbox_syscall_request *req,
+                                    long flags,
+                                    const char *translated,
+                                    struct kbox_dispatch *out);
+int try_cached_shadow_stat_dispatch(struct kbox_supervisor_ctx *ctx,
+                                    const char *translated,
+                                    uint64_t remote_stat,
+                                    pid_t pid);
+int ensure_path_shadow_cache(struct kbox_supervisor_ctx *ctx,
+                             const char *translated);
+void invalidate_path_shadow_cache(struct kbox_supervisor_ctx *ctx);
+void invalidate_translated_path_cache(struct kbox_supervisor_ctx *ctx);
+void note_shadow_writeback_open(struct kbox_supervisor_ctx *ctx,
+                                struct kbox_fd_entry *entry);
+void note_shadow_writeback_close(struct kbox_supervisor_ctx *ctx,
+                                 struct kbox_fd_entry *entry);
+int try_writeback_shadow_open(struct kbox_supervisor_ctx *ctx,
+                              const struct kbox_syscall_request *req,
+                              long lkl_fd,
+                              long flags,
+                              const char *translated,
+                              struct kbox_dispatch *out);
+/* 1 when path names a file descriptor through /proc/self/fd/N, /dev/fd/N or
+ * /proc/<pid>/fd/N; *out_fd receives N. */
+int fd_magic_link_fd(const char *path, long *out_fd);
+
+int sync_shadow_writeback(struct kbox_supervisor_ctx *ctx,
+                          struct kbox_fd_entry *entry);
+int kbox_find_active_writeback_shadow_sp(struct kbox_supervisor_ctx *ctx,
+                                         long lkl_fd);
+int kbox_reopen_writeback_shadow_ro(struct kbox_supervisor_ctx *ctx,
+                                    long lkl_fd,
+                                    int *out_memfd);
+void close_cloexec_with_writeback(struct kbox_supervisor_ctx *ctx);
+
+/* Low-fd identity and stale bridged-socket retirement (seccomp-dispatch.c). */
+uint64_t kbox_guest_fd_identity(pid_t pid, long fd);
+void kbox_retire_stale_host_fd_vfd(struct kbox_supervisor_ctx *ctx,
+                                   pid_t pid,
+                                   long host_fd,
+                                   int force);
+void kbox_sweep_stale_bridged_sockets(struct kbox_supervisor_ctx *ctx,
+                                      pid_t fallback_pid);
+int kbox_has_active_bridged_sockets(const struct kbox_supervisor_ctx *ctx);
+void kbox_sweep_stale_bridged_sockets_periodic(struct kbox_supervisor_ctx *ctx,
+                                               pid_t fallback_pid);
+
+/* Poll and cancel deferred blocking FIFO opens (seccomp-dispatch.c). */
+void kbox_poll_pending_fifo_opens(struct kbox_supervisor_ctx *ctx);
+int kbox_try_defer_connect_poll(const struct kbox_syscall_request *req,
+                                struct kbox_supervisor_ctx *ctx,
+                                struct kbox_dispatch *out);
+void kbox_poll_pending_connect_polls(struct kbox_supervisor_ctx *ctx);
+void kbox_cancel_pending_fifo_opens(struct kbox_supervisor_ctx *ctx);
+
+/* Handler functions: dispatch-net.c (networking syscalls). */
+
+struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_bind(const struct kbox_syscall_request *req,
+                                  struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_listen(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+/* Drop per-FD AF_UNIX bookkeeping when the descriptor goes away. */
+void kbox_net_forget_fd(long fd);
+void kbox_net_note_unix_nonblock(long fd, int nonblock);
+
+struct kbox_dispatch forward_accept(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_accept4(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_connect(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_sendto(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_sendmmsg(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_recvfrom(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_recvmsg(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_getsockopt(const struct kbox_syscall_request *req,
+                                        struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_setsockopt(const struct kbox_syscall_request *req,
+                                        struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_getsockname(const struct kbox_syscall_request *req,
+                                         struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_getpeername(const struct kbox_syscall_request *req,
+                                         struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_shutdown(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx);
+
+/* Handler functions: dispatch-id.c (identity syscalls). */
+
+struct kbox_dispatch dispatch_get_uid(
+    long (*lkl_func)(const struct kbox_sysnrs *),
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch dispatch_get_gid(
+    long (*lkl_func)(const struct kbox_sysnrs *),
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch dispatch_set_id(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    struct kbox_dispatch (*lkl_forward)(const struct kbox_syscall_request *req,
+                                        struct kbox_supervisor_ctx *ctx));
+struct kbox_dispatch forward_getresuid(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_getresuid_override(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    uid_t override_val);
+struct kbox_dispatch forward_getresgid(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_getresgid_override(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    gid_t override_val);
+struct kbox_dispatch forward_getgroups(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_getgroups_override(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx,
+    gid_t override_val);
+struct kbox_dispatch forward_setuid(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_setreuid(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_setresuid(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_setgid(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_setregid(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_setresgid(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_setgroups(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_setfsgid(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_umask(const struct kbox_syscall_request *req,
+                                   struct kbox_supervisor_ctx *ctx);
+
+/* Handler functions: dispatch-exec.c (exec, mprotect, clone3). */
+
+struct kbox_dispatch forward_execve(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx,
+                                    int is_execveat);
+struct kbox_dispatch forward_mprotect(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_clone3(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+void kbox_dispatch_snapshot_fork(struct kbox_supervisor_ctx *ctx,
+                                 pid_t caller_pid);
+
+/* Handler functions: dispatch-misc.c (time, info, device, memory). */
+
+struct kbox_dispatch forward_clock_gettime(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_clock_getres(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_gettimeofday(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_uname(const struct kbox_syscall_request *req,
+                                   struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_getrandom(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_syslog(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_prctl(const struct kbox_syscall_request *req,
+                                   struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_capget(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_capset(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_pipe2(const struct kbox_syscall_request *req,
+                                   struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_socketpair(const struct kbox_syscall_request *req,
+                                        struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_xattr_nodata(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
+                                   struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_pwrite64(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx);
+const char *kbox_guest_exe_for(struct kbox_supervisor_ctx *ctx, pid_t pid);
+int kbox_guest_exe_realpath(const struct kbox_supervisor_ctx *ctx,
+                            const char *in,
+                            char *out,
+                            size_t out_size);
+void kbox_guest_exe_set(struct kbox_supervisor_ctx *ctx,
+                        pid_t pid,
+                        const char *path);
+
+struct kbox_dispatch forward_pwritev(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_preadv(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_pwritev2(const struct kbox_syscall_request *req,
+                                      struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_preadv2(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_writev(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_readv(const struct kbox_syscall_request *req,
+                                   struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_ftruncate(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_fallocate(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_flock(const struct kbox_syscall_request *req,
+                                   struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_fchown(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_fchmod(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_fadvise64(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_fsync(const struct kbox_syscall_request *req,
+                                   struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_fdatasync(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_sync(const struct kbox_syscall_request *req,
+                                  struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_sync_file_range(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_symlinkat(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_linkat(const struct kbox_syscall_request *req,
+                                    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_utimensat(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_readlinkat(const struct kbox_syscall_request *req,
+                                        struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
+                                  struct kbox_supervisor_ctx *ctx);
+int dispatch_vcred_identity(const struct kbox_syscall_request *req,
+                            struct kbox_supervisor_ctx *ctx,
+                            struct kbox_dispatch *out);
+struct kbox_dispatch forward_sendmsg(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_eventfd(const struct kbox_syscall_request *req,
+                                     struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_memfd_create(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_signalfd4(const struct kbox_syscall_request *req,
+                                       struct kbox_supervisor_ctx *ctx);
+
+struct kbox_dispatch forward_timerfd_create(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+struct kbox_dispatch forward_epoll_create1(
+    const struct kbox_syscall_request *req,
+    struct kbox_supervisor_ctx *ctx);
+
+/* Clone namespace flags (portable fallbacks for older headers). */
+
+#ifndef CLONE_NEWNS
+#define CLONE_NEWNS 0x00020000ULL
+#endif
+#ifndef CLONE_NEWTIME
+#define CLONE_NEWTIME 0x00000080ULL
+#endif
+#ifndef CLONE_NEWCGROUP
+#define CLONE_NEWCGROUP 0x02000000ULL
+#endif
+#ifndef CLONE_NEWUTS
+#define CLONE_NEWUTS 0x04000000ULL
+#endif
+#ifndef CLONE_NEWIPC
+#define CLONE_NEWIPC 0x08000000ULL
+#endif
+#ifndef CLONE_NEWUSER
+#define CLONE_NEWUSER 0x10000000ULL
+#endif
+#ifndef CLONE_NEWPID
+#define CLONE_NEWPID 0x20000000ULL
+#endif
+#ifndef CLONE_NEWNET
+#define CLONE_NEWNET 0x40000000ULL
+#endif
+#ifndef CLONE_THREAD
+#define CLONE_THREAD 0x00010000ULL
+#endif
+
+#define CLONE_NEW_MASK                                              \
+    (CLONE_NEWNS | CLONE_NEWTIME | CLONE_NEWCGROUP | CLONE_NEWUTS | \
+     CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET)
+
+#endif /* KBOX_DISPATCH_INTERNAL_H */

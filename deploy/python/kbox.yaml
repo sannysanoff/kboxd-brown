@@ -1,0 +1,159 @@
+# kbox in a namespace with no privileges at all.
+#
+# The pod gets: no capabilities, no privilege escalation, the runtime default
+# seccomp profile, no service-account token, and uid 65534. kboxd still builds
+# per-container mount/net/UTS namespaces and overlay rootfs, because all of it
+# happens inside the LKL kernel it carries in-process.
+#
+# Used to check that `docker run python ...` works inside the pod with the
+# Docker Engine shim (kbox-dockerd.py) in front of kboxd.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kbox-config
+  namespace: kbox-python
+data:
+  kbox-config.yaml: |
+    network:
+      start_ip: 172.19.0.10
+      gateway: 172.19.0.1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbox
+  namespace: kbox-python
+  labels:
+    app: kbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kbox
+  template:
+    metadata:
+      labels:
+        app: kbox
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kboxd
+          image: kbox-python/kbox:v72
+          imagePullPolicy: IfNotPresent
+          args:
+            - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=6144M loglevel=4"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+            # kboxd needs pidfd_getfd: it takes a supervisor-side copy of a
+            # tracee FD that shares the same file description (sendfile into a
+            # bridged socket, dup/F_DUPFD of a host descriptor). The runtime's
+            # default profile denies that call, exactly as running kbox on a
+            # host with the default docker profile does; kbox is run with
+            # --security-opt seccomp=unconfined locally for the same reason.
+            seccompProfile:
+              type: Unconfined
+          env:
+            - name: HOME
+              value: /dev/shm
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /data
+            - name: run
+              mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 12Gi
+        - name: shim
+          image: kbox-python/kbox:v72
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOME
+              value: /dev/shm
+          command:
+            - /usr/bin/python3
+            - /usr/local/bin/kbox-dockerd.py
+            - --kbox-sock
+            - /run/kbox/kboxd.sock
+            - --config
+            - /etc/kbox/kbox-config.yaml
+            - --listen
+            - 0.0.0.0:2376
+            - --state-dir
+            - /data/kbox-dockerd
+            - -v
+          ports:
+            - name: docker-api
+              containerPort: 2376
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: run
+              mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          startupProbe:
+            tcpSocket:
+              port: 2376
+            periodSeconds: 2
+            failureThreshold: 150
+      volumes:
+        - name: config
+          configMap:
+            name: kbox-config
+        - name: state
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+        - name: data
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kbox
+  namespace: kbox-python
+spec:
+  selector:
+    app: kbox
+  ports:
+    - name: docker-api
+      port: 2376
+      targetPort: 2376
+      protocol: TCP

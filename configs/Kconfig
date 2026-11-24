@@ -1,0 +1,102 @@
+# kbox Configuration
+
+mainmenu "kbox Configuration"
+
+# Feature Selection
+
+menu "Features"
+
+config HAS_SLIRP
+    bool "SLIRP networking (userspace TCP/IP)"
+    default y
+    help
+      Enable userspace networking via minislirp.
+      Provides TCP/IP connectivity for guest processes without
+      root privileges or TUN/TAP devices.
+      The minislirp library is fetched automatically if missing.
+
+config HAS_WEB
+    bool "Web observatory dashboard"
+    default y
+    help
+      Enable the built-in web telemetry server.
+      Provides a real-time dashboard for monitoring syscall
+      activity, FD table state, and performance counters.
+      Serves compiled-in HTML/CSS/JS assets on a local port.
+
+endmenu
+
+# Syscall Interception
+
+menu "Syscall Interception"
+
+config SYSCALL_FAST_PATH
+    bool "AUTO mode uses rewrite/trap fast-path"
+    default y
+    help
+      When enabled, AUTO mode selects binary rewriting (Tier 2) or
+      SIGSYS trap (Tier 1) for non-shell, non-networking binaries
+      on both x86_64 and aarch64.
+
+      Typical speedups (release build, vs seccomp baseline):
+        aarch64: stat 8x faster, open+close 1.4x faster
+        x86_64:  open+close 1.3x faster, lseek+read 1.7x faster
+
+      The fast-path is automatically disabled in ASAN/UBSAN builds
+      because the trap path switches to a guest stack that ASAN
+      cannot track.  Sanitizer builds use seccomp for correctness
+      testing; release builds get the full fast-path.
+
+      If unsure, say Y.
+
+config STAT_CACHE_SIZE
+    int "FD-local stat cache entries"
+    default 16
+    range 0 256
+    help
+      Number of entries in the per-context fstat result cache.
+      Avoids repeated LKL inode lookups for fstat on the same FD.
+      Set to 0 to disable the cache entirely.
+
+      The cache is invalidated on write, close, truncate, and
+      fallocate operations on the cached FD.
+
+endmenu
+
+# Build Options
+
+menu "Build Options"
+
+choice
+    prompt "Build Mode"
+    default BUILD_DEBUG
+
+config BUILD_DEBUG
+    bool "Debug (ASAN/UBSAN, -O0 -g3)"
+    help
+      Development build with AddressSanitizer and
+      UndefinedBehaviorSanitizer enabled.
+      Slower execution but catches memory errors.
+
+config BUILD_RELEASE
+    bool "Release (-O2, no sanitizers)"
+    help
+      Optimized build for production use.
+      No sanitizers, no debug symbols.
+
+endchoice
+
+config LKL_DIR
+    string "LKL library directory"
+    default ""
+    help
+      Path to the LKL (Linux Kernel Library) directory.
+      Leave empty to use the default: lkl-$(ARCH).
+      The LKL library is fetched automatically if missing.
+
+endmenu
+
+# Marker for configured builds
+config CONFIGURED
+    bool
+    default y

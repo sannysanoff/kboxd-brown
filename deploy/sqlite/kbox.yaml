@@ -1,0 +1,179 @@
+# kbox in a namespace with no privileges at all, running the sqllogictest
+# corpus.
+#
+# The pod gets: no capabilities, no privilege escalation, no service-account
+# token, and uid 65534. kboxd still builds per-container mount/net/UTS
+# namespaces and overlay rootfs, because all of it happens inside the LKL
+# kernel it carries in-process. The only concession is the seccomp profile on
+# kboxd: it needs pidfd_getfd, which the runtime default profile denies.
+#
+# /data is node disk and holds the corpus, the static runner, and the results.
+# /dev/shm is tmpfs and holds HOME (the image store) plus the exec links.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kbox-config
+  namespace: kbox-sqlite
+data:
+  kbox-config.yaml: |
+    network:
+      start_ip: 172.20.0.10
+      gateway: 172.20.0.1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbox
+  namespace: kbox-sqlite
+  labels:
+    app: kbox
+spec:
+  replicas: 1
+  # The corpus lives on a ReadWriteOnce volume. A rolling update would hold the
+  # old pod's claim while the new pod starts, so replace instead.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kbox
+  template:
+    metadata:
+      labels:
+        app: kbox
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kboxd
+          image: kbox-sqlite/kbox:v7
+          imagePullPolicy: IfNotPresent
+          args:
+            - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=6144M loglevel=4"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+            # kboxd needs pidfd_getfd: it takes a supervisor-side copy of a
+            # tracee FD that shares the same file description (sendfile into a
+            # bridged socket, dup/F_DUPFD of a host descriptor). The default
+            # profile denies that call.
+            seccompProfile:
+              type: Unconfined
+          env:
+            - name: HOME
+              value: /dev/shm
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /data
+            - name: run
+              mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 12Gi
+        - name: shim
+          image: kbox-sqlite/kbox:v7
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOME
+              value: /dev/shm
+          command:
+            - /usr/bin/python3
+            - /usr/local/bin/kbox-dockerd.py
+            - --kbox-sock
+            - /run/kbox/kboxd.sock
+            - --config
+            - /etc/kbox/kbox-config.yaml
+            - --listen
+            - 0.0.0.0:2376
+            - --state-dir
+            - /data/kbox-dockerd
+            - -v
+          ports:
+            - name: docker-api
+              containerPort: 2376
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: run
+              mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          startupProbe:
+            tcpSocket:
+              port: 2376
+            periodSeconds: 2
+            failureThreshold: 150
+      volumes:
+        - name: config
+          configMap:
+            name: kbox-config
+        - name: state
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+        # The corpus is 1.1 GB. A PVC keeps it across rollouts; an emptyDir
+        # would force a re-push on every image change.
+        - name: data
+          persistentVolumeClaim:
+            claimName: kbox-data
+        - name: run
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kbox-data
+  namespace: kbox-sqlite
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 3Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kbox
+  namespace: kbox-sqlite
+spec:
+  selector:
+    app: kbox
+  ports:
+    - name: docker-api
+      port: 2376
+      targetPort: 2376
+      protocol: TCP

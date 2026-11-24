@@ -1,0 +1,206 @@
+# kbox-layers plus what a compose stack needs: a persistent /data volume
+# (layer cache, registry, repo checkout) and a pod-local registry that hosts
+# push to through kubectl port-forward. Derived from kbox.yaml.
+# kbox in a namespace with no privileges at all, used for image-layer work.
+#
+# The pod gets: no capabilities, no privilege escalation, the runtime default
+# seccomp profile, no service-account token, and uid 65534. kboxd still builds
+# per-container mount/net/UTS namespaces and overlay rootfs, because all of it
+# happens inside the LKL kernel it carries in-process.
+#
+# The Docker Engine shim (kbox-dockerd.py) listens on 2376 in front of kboxd,
+# so `docker pull`/`docker run` reach the guest kernel like a real engine.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kbox-config
+  namespace: kbox-layers
+data:
+  kbox-config.yaml: |
+    network:
+      start_ip: 172.19.0.10
+      gateway: 172.19.0.1
+
+    # Images are mounted straight from the host shim state instead of being
+    # copied into guest RAM, and each container's writable layer is a host
+    # directory under ephemeral_root.
+    storage:
+      images: hostfs
+      ephemeral: hostfs
+      ephemeral_root: /tmp/.kboxd/ephemeral
+      # Layer cache of the shim. Downloaded blobs are kept separately from the
+      # unpacked layers, so a layer is fetched and unpacked once per pod.
+      blobs_dir: /data/kbox-dockerd/blobs
+      layers_dir: /data/kbox-dockerd/layers
+      images_dir: /data/kbox-dockerd/images
+      manifests_dir: /data/kbox-dockerd/manifests
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbox
+  namespace: kbox-layers
+  labels:
+    app: kbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kbox
+  template:
+    metadata:
+      labels:
+        app: kbox
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kboxd
+          image: kbox-layers/kbox:v35
+          imagePullPolicy: IfNotPresent
+          args:
+            - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=6144M loglevel=4" -v
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOME
+              value: /dev/shm
+          ports:
+            - name: docker-api
+              containerPort: 2376
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /data
+            - name: run
+              mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 22Gi
+          startupProbe:
+            tcpSocket:
+              port: 2376
+            periodSeconds: 2
+            failureThreshold: 150
+        - name: shim
+          image: kbox-layers/kbox:v35
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOME
+              value: /dev/shm
+          command:
+            - /usr/bin/python3
+            - /usr/local/bin/kbox-dockerd.py
+            - --kbox-sock
+            - /run/kbox/kboxd.sock
+            - --config
+            - /etc/kbox/kbox-config.yaml
+            - --listen
+            - 0.0.0.0:2376
+            - --state-dir
+            - /data/kbox-dockerd
+            - -v
+          ports:
+            - name: docker-api
+              containerPort: 2376
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: run
+              mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          startupProbe:
+            tcpSocket:
+              port: 2376
+            periodSeconds: 2
+            failureThreshold: 150
+        # Pod-local registry: images built on the host are pushed here through
+        # kubectl port-forward and pulled by kboxd from localhost:5000.
+        - name: registry
+          image: registry:2
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+              value: /data/registry
+            - name: REGISTRY_HTTP_ADDR
+              value: 127.0.0.1:5000
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: kbox-config
+        - name: state
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+        - name: data
+          persistentVolumeClaim:
+            claimName: kbox-layers-data
+        - name: run
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kbox
+  namespace: kbox-layers
+spec:
+  selector:
+    app: kbox
+  ports:
+    - name: docker-api
+      port: 2376
+      targetPort: 2376
+      protocol: TCP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kbox-layers-data
+  namespace: kbox-layers
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 40Gi

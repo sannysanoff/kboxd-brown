@@ -1,0 +1,67 @@
+# NFS server for the kbox NFS-volume test.
+#
+# NFSv4.2 only, one TCP channel on an unprivileged port, no rpcbind client
+# dependency, no portmapper dance for the client. The export lives on a
+# loopback ext4 image because ganesha's FSAL_VFS resolves file handles with
+# name_to_handle_at/open_by_handle_at, which overlayfs (and btrfs subvolumes)
+# refuse — the client then sees EIO on readdir. That, and only that, is why
+# this pod is privileged; on a host whose export directory sits on ext4 or
+# XFS it needs nothing beyond CAP_DAC_READ_SEARCH.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ganesha
+  namespace: nfs-test
+  labels:
+    app: ganesha
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ganesha
+  template:
+    metadata:
+      labels:
+        app: ganesha
+    spec:
+      containers:
+        - name: ganesha
+          image: kbox-nfs-test/ganesha:net
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          ports:
+            - name: nfs
+              containerPort: 20490
+              protocol: TCP
+          volumeMounts:
+            - name: exportdisk
+              mountPath: /exportdisk
+          readinessProbe:
+            tcpSocket:
+              port: 20490
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: exportdisk
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ganesha
+  namespace: nfs-test
+spec:
+  selector:
+    app: ganesha
+  ports:
+    - name: nfs
+      port: 20490
+      targetPort: 20490
+      protocol: TCP

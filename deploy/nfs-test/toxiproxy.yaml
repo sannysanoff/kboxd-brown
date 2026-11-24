@@ -1,0 +1,47 @@
+# Toxiproxy in front of ganesha, used to inject latency and blackouts so the
+# NFS client's timeo/retrans behaviour and the hard-vs-soft distinction can be
+# measured instead of guessed.
+apiVersion: v1
+kind: Service
+metadata:
+  name: toxiproxy
+  namespace: nfs-test
+spec:
+  selector:
+    app: toxiproxy
+  ports:
+    - name: nfs
+      port: 20491
+      targetPort: 20491
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toxiproxy
+  namespace: nfs-test
+  labels:
+    app: toxiproxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: toxiproxy
+  template:
+    metadata:
+      labels:
+        app: toxiproxy
+    spec:
+      containers:
+        - name: toxiproxy
+          image: kbox-nfs-test/socat:v2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: nfs
+              containerPort: 20491
+          # No readiness probe on purpose: the pod must stay Ready while the
+          # proxy process is stopped, so the client sees an unanswered
+          # connection (a timeout) instead of a refused one.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi

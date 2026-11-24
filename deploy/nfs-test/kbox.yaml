@@ -1,0 +1,198 @@
+# kbox with an NFS volume, run without any privileges.
+#
+# The pod gets: no capabilities, no privilege escalation, the runtime's default
+# seccomp profile, no service-account token, and a non-root user. kboxd still
+# builds per-service mount/net/UTS namespaces and mount an NFS export, because
+# all of that happens inside the LKL kernel it carries in-process — the host
+# kernel only ever sees ordinary syscalls from an unprivileged process.
+#
+# The NFS handle is declared once, in the config file (~/.config/kbox-config.yaml
+# in the pod), and services refer to it by the hard-coded scheme name:
+#
+#   "nfs://mounted_here/subdir:/destination"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kbox-config
+  namespace: nfs-test
+data:
+  kbox-config.yaml: |
+    network:
+      start_ip: 172.19.0.10
+      gateway: 172.19.0.1
+
+    mounts:
+      "nfs://mounted_here":
+        source: ganesha.nfs-test.svc.cluster.local:/
+        options: vers=4.2,proto=tcp,port=20490,rsize=65536,wsize=65536
+      # Direct, with an explicit retransmit budget, so a silenced server is
+      # measurable: hard keeps retrying, soft gives up with EIO.
+      "nfs://hard_direct":
+        source: ganesha.nfs-test.svc.cluster.local:/
+        options: vers=4.2,proto=tcp,port=20490,hard,timeo=50,retrans=2
+      "nfs://soft_direct":
+        source: ganesha.nfs-test.svc.cluster.local:/
+        options: vers=4.2,proto=tcp,port=20490,soft,timeo=50,retrans=2
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kbox-data
+  namespace: nfs-test
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 4Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbox
+  namespace: nfs-test
+  labels:
+    app: kbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kbox
+  template:
+    metadata:
+      labels:
+        app: kbox
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kboxd
+          image: kbox-nfs-test/kbox:v149
+          imagePullPolicy: IfNotPresent
+          args:
+            - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=10240M loglevel=4"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOME
+              value: /dev/shm
+          ports:
+            - name: docker-api
+              containerPort: 2376
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /data
+            - name: run
+              mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 22Gi
+          # kboxd only opens its control socket once every declared NFS export
+          # is mounted, and it retries until then, so a slow ganesha start does
+          # not need an initContainer.
+          startupProbe:
+            tcpSocket:
+              port: 2376
+            periodSeconds: 2
+            failureThreshold: 150
+        - name: shim
+          image: kbox-nfs-test/kbox:v149
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOME
+              value: /dev/shm
+          command:
+            - /usr/bin/python3
+            - /usr/local/bin/kbox-dockerd.py
+            - --kbox-sock
+            - /run/kbox/kboxd.sock
+            - --config
+            - /etc/kbox/kbox-config.yaml
+            - --listen
+            - 0.0.0.0:2376
+            - --state-dir
+            - /data/kbox-dockerd
+            - -v
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: run
+              mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
+            - name: data
+              mountPath: /data
+        # Pod-local image registry. kbox cannot `docker build` or `docker load`,
+        # so images built on the host are pushed here (through kubectl
+        # port-forward) and pulled by kboxd from localhost:5000 over plain HTTP.
+        - name: registry
+          image: registry:2
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+              value: /data/registry
+            - name: REGISTRY_HTTP_ADDR
+              value: 127.0.0.1:5000
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: kbox-config
+        - name: state
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+        - name: data
+          persistentVolumeClaim:
+            claimName: kbox-data
+        - name: run
+          emptyDir: {}
+        # kboxd writes container and exec output here and the shim streams it
+        # back for docker logs / exec / run / attach.
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kbox
+  namespace: nfs-test
+spec:
+  selector:
+    app: kbox
+  ports:
+    - name: docker-api
+      port: 2376
+      targetPort: 2376
+      protocol: TCP

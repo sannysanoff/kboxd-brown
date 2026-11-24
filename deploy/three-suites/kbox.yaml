@@ -1,0 +1,159 @@
+# kbox running three real server suites, unprivileged.
+#
+# The pod has no privileges at all: uid 65534, every capability set empty, no
+# service-account token. kboxd still builds per-container mount/net/UTS
+# namespaces and its own overlay rootfs, because all of it happens inside the
+# LKL kernel it carries in-process.
+#
+# The kboxd container needs seccomp Unconfined for pidfd_getfd: it takes a
+# supervisor-side copy of a tracee descriptor that shares the same file
+# description (sendfile into a bridged socket, dup/F_DUPFD of a host
+# descriptor). The runtime's default profile denies that call. The shim stays
+# on RuntimeDefault.
+#
+# Storage defaults are host-backed (images: hostfs, ephemeral: hostfs), so image
+# layers and container upper dirs live in /data, the emptyDir below, rather than
+# in guest memory.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kbox-three-suites
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kbox-config
+  namespace: kbox-three-suites
+data:
+  kbox-config.yaml: |
+    network:
+      start_ip: 172.19.0.10
+      gateway: 172.19.0.1
+    storage:
+      images: hostfs
+      ephemeral: hostfs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kbox
+  namespace: kbox-three-suites
+  labels:
+    app: kbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kbox
+  template:
+    metadata:
+      labels:
+        app: kbox
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kboxd
+          image: kbox-python/kbox:v215
+          imagePullPolicy: IfNotPresent
+          args:
+            - exec /usr/local/bin/kbox daemon --sock /run/kbox/kboxd.sock --config /etc/kbox/kbox-config.yaml --cmdline "mem=6144M loglevel=4" 2>>/data/kboxd.log
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: Unconfined
+          env:
+            - name: HOME
+              value: /dev/shm
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /data
+            - name: run
+              mountPath: /run/kbox
+            - name: logs
+              mountPath: /tmp/kboxd-logs
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 12Gi
+        - name: shim
+          image: kbox-python/kbox:v215
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOME
+              value: /dev/shm
+          command:
+            - /usr/bin/python3
+            - /usr/local/bin/kbox-dockerd.py
+            - --kbox-sock
+            - /run/kbox/kboxd.sock
+            - --config
+            - /etc/kbox/kbox-config.yaml
+            - --listen
+            - 0.0.0.0:2376
+            - --state-dir
+            - /data/kbox-dockerd
+            - -v
+          ports:
+            - name: docker-api
+              containerPort: 2376
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kbox
+              readOnly: true
+            - name: state
+              mountPath: /dev/shm
+            - name: run
+              mountPath: /run/kbox
+            - name: data
+              mountPath: /data
+            - name: logs
+              mountPath: /tmp/kboxd-logs
+      volumes:
+        - name: config
+          configMap:
+            name: kbox-config
+        - name: state
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+        - name: data
+          emptyDir:
+            sizeLimit: 24Gi
+        - name: run
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kbox
+  namespace: kbox-three-suites
+spec:
+  selector:
+    app: kbox
+  ports:
+    - name: docker-api
+      port: 2376
+      targetPort: 2376
