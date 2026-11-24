@@ -12,6 +12,14 @@ uid 65534, every capability dropped — answers `docker run`, `docker compose`
 and `-v` volumes, because the kernel work happens in LKL inside the same
 process instead of in a daemon that needs privileges.
 
+## Purpose
+
+The main reason for this project is to run `docker compose` inside
+unprivileged Kubernetes containers. Two targets drive the work: CI/CD
+pipelines, where the runner pod holds no privilege and cannot start a real
+Docker daemon, and agentic development, where an agent needs containers to
+build, test and run code without a privileged host.
+
 kbox boots a real Linux kernel as an in-process library
 ([LKL, the Linux Kernel Library](https://github.com/lkl/linux)) and routes
 intercepted syscalls to it. Programs get real
