@@ -1,0 +1,27 @@
+# Baseline for this brown slopware: the LKL tree vendored in this directory.
+#
+# Copied by value from sannysanoff/linux, a fork of lkl/linux. The copy holds
+# no git metadata; scripts/build-lkl.sh builds it in place.
+repository=https://github.com/sannysanoff/linux
+branch=master
+commit=9265c16bf64da88a5b9a3165abd7c10434a84059
+date=2026-11-20T15:12:26+01:00
+
+# Paths removed from the copy because each one differs from a kept path only
+# by case, and a case-insensitive filesystem cannot hold both spellings. The
+# kept spelling is the lowercase one. The twelve netfilter targets are
+# disabled in the kbox LKL configuration, and the kernel build never reads the
+# litmus test.
+removed=include/uapi/linux/netfilter/xt_CONNMARK.h
+removed=include/uapi/linux/netfilter/xt_DSCP.h
+removed=include/uapi/linux/netfilter/xt_MARK.h
+removed=include/uapi/linux/netfilter/xt_RATEEST.h
+removed=include/uapi/linux/netfilter/xt_TCPMSS.h
+removed=include/uapi/linux/netfilter_ipv4/ipt_ECN.h
+removed=include/uapi/linux/netfilter_ipv4/ipt_TTL.h
+removed=include/uapi/linux/netfilter_ipv6/ip6t_HL.h
+removed=net/netfilter/xt_DSCP.c
+removed=net/netfilter/xt_HL.c
+removed=net/netfilter/xt_RATEEST.c
+removed=net/netfilter/xt_TCPMSS.c
+removed=tools/memory-model/litmus-tests/Z6.0+pooncelock+poonceLock+pombonce.litmus
