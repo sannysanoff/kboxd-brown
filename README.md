@@ -137,6 +137,29 @@ binary rewriting), each trading isolation for speed. The default
 [docs/interception-tiers.md](docs/interception-tiers.md) for the
 trade-offs and selection rules.
 
+## Baseline for this brown slopware
+
+This tree is a re-import of `sannysanoff/kbox` with LKL vendored by value in
+`vendor/lkl`. It starts from these two upstream commits:
+
+| Component | Repository | Commit | Commit date |
+|---|---|---|---|
+| kbox | [`sannysanoff/kbox`](https://github.com/sannysanoff/kbox) | `2ce27357aa3ec3c1f120ff1c6cf4b683a07a8216` | 2026-11-23 23:26:54 +0000 |
+| LKL (`vendor/lkl`) | [`sannysanoff/linux`](https://github.com/sannysanoff/linux) | `9265c16bf64da88a5b9a3165abd7c10434a84059` | 2026-11-20 15:12:26 +0100 |
+
+`vendor/lkl` is that LKL commit copied without git metadata, so a checkout of
+this repository builds the same kernel the upstream fork builds. `make` reads
+the tree in place; nothing is cloned and nothing is checked out.
+
+`vendor/` is exempt from the repository hooks: formatting, whitespace and C
+safety checks see kbox's own sources only.
+
+LKL names that differ only in case appear once, under the lowercase spelling,
+because a case-insensitive filesystem cannot hold both. Twelve removed paths
+are netfilter targets that are disabled in the kbox LKL configuration; the
+thirteenth is a litmus test that the kernel build never reads. The full list
+is in `vendor/lkl/BASELINE`.
+
 ## Building
 
 Linux only (host kernel 5.0+ for
@@ -145,8 +168,8 @@ Linux only (host kernel 5.0+ for
 [FSGSBASE](https://docs.kernel.org/arch/x86/x86_64/fsgs.html) trap
 optimization). Requires [GCC](https://gcc.gnu.org/) and
 [GNU Make](https://www.gnu.org/software/make/). `liblkl.a` is built from
-source automatically on the first build: the upstream fork's master is cloned
-into `build/lkl-src` and compiled, and the library is reused from then on. No
+source automatically on the first build from the vendored tree in
+`vendor/lkl`, and the library is reused from then on. No
 [`libseccomp`](https://github.com/seccomp/libseccomp) dependency.
 
 ```bash
@@ -166,6 +189,7 @@ To use a custom LKL:
 
 ```bash
 make LKL_DIR=/path/to/lkl   # point to a directory with liblkl.a + lkl.h
+make LKL_SRC=/path/to/linux # build another LKL source tree
 make FORCE_LKL_BUILD=1      # force a from-source LKL rebuild
 ```
 

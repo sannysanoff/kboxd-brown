@@ -106,7 +106,7 @@ HOSTFS_TEST = tests/lkl/hostfs-test
 
 $(HOSTFS_TEST): tests/lkl/hostfs-test.c $(LKL_LIB)
 	@echo "  LD      $@"
-	$(Q)$(CC) -O1 -o $@ $< -Ibuild/lkl-src/tools/lkl/include \
+	$(Q)$(CC) -O1 -o $@ $< -I$(LKL_SRC)/tools/lkl/include \
 		-L$(LKL_DIR) -llkl -lpthread -lrt -lm
 
 check-hostfs: $(HOSTFS_TEST)

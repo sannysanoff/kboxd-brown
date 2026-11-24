@@ -44,6 +44,11 @@ else
   LDFLAGS += -fsanitize=address,undefined
 endif
 
+# LKL source tree (vendored by value; override to build another tree)
+ifeq ($(strip $(LKL_SRC)),)
+  LKL_SRC := vendor/lkl
+endif
+
 # LKL library location (from Kconfig or command line)
 ifdef CONFIG_LKL_DIR
   LKL_DIR := $(patsubst "%",%,$(CONFIG_LKL_DIR))

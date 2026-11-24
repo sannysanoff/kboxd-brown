@@ -263,16 +263,30 @@ printf "${CYAN}Running pre-commit checks...${NC}\n\n"
 
 workspace=$(git rev-parse --show-toplevel)
 
+# Paths under vendor/ hold third-party code kept by value. Its style,
+# whitespace and C patterns are not this project's, so no check reads them.
+is_vendored() {
+    case "$1" in
+    vendor/*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
 # Gather all staged info in as few git calls as possible.
 # --no-renames: treats renames as delete+add (avoids "old => new" path corruption).
 # -z: NUL-terminated output. Format: "add\tdel\tpath\0" per entry.
 FILES=()
 FILE_SUMMARIES=()
 binary_files=()
+vendored_count=0
 while IFS= read -r -d '' record; do
     [ -z "$record" ] && continue
     add="${record%%	*}"; rest="${record#*	}"
     del="${rest%%	*}"; path="${rest#*	}"
+    is_vendored "$path" && {
+        vendored_count=$((vendored_count + 1))
+        continue
+    }
     FILES+=("$path")
     if [ "$add" = "-" ] && [ "$del" = "-" ]; then
         binary_files+=("$path")
@@ -289,7 +303,11 @@ while IFS= read -r -d '' record; do
 done < <(git diff --cached --numstat --no-renames --diff-filter=ACM -z 2>/dev/null)
 
 if [ ${#FILES[@]} -eq 0 ]; then
-    printf "${YELLOW}No files staged for commit.${NC}\n"
+    if [ $vendored_count -gt 0 ]; then
+        printf "${YELLOW}Only vendored files staged (%d under vendor/); vendor/ is exempt from all checks.${NC}\n" "$vendored_count"
+    else
+        printf "${YELLOW}No files staged for commit.${NC}\n"
+    fi
     exit 0
 fi
 
@@ -299,6 +317,7 @@ fi
 C_FILES_CHANGED=()
 if git rev-parse --verify HEAD >/dev/null 2>&1; then
     while IFS= read -r -d '' f; do
+        is_vendored "$f" && continue
         [[ $f == *.c || $f == *.h ]] && C_FILES_CHANGED+=("$f")
     done < <(git diff --cached --name-only --no-renames --diff-filter=ACM HEAD -z 2>/dev/null)
 else
@@ -364,7 +383,7 @@ fi
 
 # === CHECK 4: Whitespace errors ===
 update_progress "Checking for whitespace errors"
-ws_errors=$(git diff --cached --check 2>&1 || true)
+ws_errors=$(git diff --cached --check -- . ':(exclude)vendor' 2>&1 || true)
 if [ -n "$ws_errors" ]; then
     ws_count=$(echo "$ws_errors" | wc -l)
     report_result 1 "Whitespace errors in $ws_count location(s)"
@@ -728,6 +747,9 @@ printf "\r%*s\r" 50 ""
 
 # --- Summary (FILE_SUMMARIES already populated from initial numstat) ---
 printf "\n"
+if [ $vendored_count -gt 0 ]; then
+    printf "${WHITE}%d vendored file(s) under vendor/ not checked${NC}\n" "$vendored_count"
+fi
 printf "${CYAN}Files to be committed:${NC}\n"
 for i in "${!FILES[@]}"; do
     file="${FILES[$i]}"

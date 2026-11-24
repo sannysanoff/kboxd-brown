@@ -1,14 +1,16 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# Build liblkl.a from source (sannysanoff/linux, a fork of lkl/linux) and
-# populate lkl-<ARCH>/.
+# Build liblkl.a from the vendored LKL tree (vendor/lkl, a copy of
+# sannysanoff/linux, a fork of lkl/linux) and populate lkl-<ARCH>/.
 #
 # Usage: ./scripts/build-lkl.sh [ARCH]
 #   ARCH defaults to the host architecture (x86_64 or aarch64).
 #   Override LKL_DIR   to change the output directory.
-#   Override LKL_SRC   to reuse an existing source tree (skip clone).
-#   Override LKL_REF   to check out a specific branch/tag/commit
-#                      (default: HEAD of master).
+#   Override LKL_SRC   to build another LKL source tree.
+#
+# There is no clone and no checkout: the tree in the repository is the tree
+# that gets built. The commit it was taken from is recorded in
+# vendor/lkl/BASELINE.
 
 set -eu
 
@@ -17,74 +19,9 @@ set -eu
 detect_arch "${1:-}"
 
 LKL_DIR="${LKL_DIR:-lkl-${ARCH}}"
-LKL_SRC="${LKL_SRC:-build/lkl-src}"
-# Fork of lkl/linux that carries the LKL commit kbox is built and tested
-# against (branch "kbox"). Use LKL_REF=kbox to pin to that branch; the
-# default keeps the fork's default branch.
-LKL_UPSTREAM="${LKL_UPSTREAM:-https://github.com/sannysanoff/linux}"
+LKL_SRC="${LKL_SRC:-vendor/lkl}"
 
-is_commit_sha()
-{
-    case "$1" in
-        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*)
-            case "$1" in
-                *[!0-9a-fA-F]*)
-                    return 1
-                    ;;
-            esac
-            return 0
-            ;;
-    esac
-
-    return 1
-}
-
-checkout_lkl_ref()
-{
-    ref="$1"
-
-    echo "  CHECKOUT ${ref}"
-    if is_commit_sha "$ref"; then
-        # Bare commit SHAs are not advertised as remote refs, so a shallow
-        # ref fetch is not reliable. Ensure full history before checkout.
-        if git -C "${LKL_SRC}" rev-parse --is-shallow-repository > /dev/null 2>&1 \
-            && [ "$(git -C "${LKL_SRC}" rev-parse --is-shallow-repository)" = "true" ]; then
-            git -C "${LKL_SRC}" fetch --unshallow origin
-        else
-            git -C "${LKL_SRC}" fetch origin
-        fi
-        git -C "${LKL_SRC}" checkout "${ref}"
-    else
-        git -C "${LKL_SRC}" fetch --depth=1 origin "${ref}"
-        git -C "${LKL_SRC}" checkout FETCH_HEAD
-    fi
-}
-
-# ---- Clone or update source tree ----------------------------------------
-
-if [ -d "${LKL_SRC}/.git" ]; then
-    echo "  SRC     ${LKL_SRC} (exists, skipping clone)"
-    if [ -n "${LKL_REF:-}" ]; then
-        checkout_lkl_ref "${LKL_REF}"
-    fi
-else
-    echo "  CLONE   ${LKL_UPSTREAM} -> ${LKL_SRC}"
-    mkdir -p "$(dirname "${LKL_SRC}")"
-
-    if [ -n "${LKL_REF:-}" ] && is_commit_sha "${LKL_REF}"; then
-        # Commit SHAs require full history because remotes typically do not
-        # advertise arbitrary object IDs as shallow-fetchable refs.
-        git clone "${LKL_UPSTREAM}" "${LKL_SRC}"
-        checkout_lkl_ref "${LKL_REF}"
-    else
-        # Shallow clone of default branch, then checkout specific branch/tag if
-        # requested. git clone --branch does not accept bare commit SHAs.
-        git clone --depth=1 "${LKL_UPSTREAM}" "${LKL_SRC}"
-        if [ -n "${LKL_REF:-}" ]; then
-            checkout_lkl_ref "${LKL_REF}"
-        fi
-    fi
-fi
+[ -f "${LKL_SRC}/Makefile" ] || die "LKL source tree not found at ${LKL_SRC}"
 
 # ---- Kernel-side requirements -------------------------------------------
 
@@ -94,7 +31,13 @@ fi
 #   4710939b6 overlayfs: honour userxattr whiteouts in the upper layer
 #   ba619e886 hostfs: support xattrs, tmpfiles and unprivileged whiteouts
 #
-# Nothing is patched here, so a fresh clone of the fork is the source of truth.
+# Nothing is patched here: the vendored tree is built as committed.
+#
+# The only difference from sannysanoff/linux is that names differing only in
+# case are present once, under the lowercase spelling (netfilter target/match
+# pairs and one litmus test). A case-insensitive filesystem cannot hold both,
+# and every removed spelling belongs to a config that is off in kbox's LKL
+# configuration. See vendor/lkl/BASELINE.
 
 # ---- Configure -----------------------------------------------------------
 
@@ -227,8 +170,15 @@ cp "${LKL_SRC}/tools/lkl/include/lkl.h" "${LKL_DIR}/" 2> /dev/null || true
 cp "${LKL_SRC}/tools/lkl/include/lkl/autoconf.h" "${LKL_DIR}/" 2> /dev/null || true
 cp "${LKL_SRC}/scripts/gdb/vmlinux-gdb.py" "${LKL_DIR}/" 2> /dev/null || true
 
+lkl_commit=unknown
+if [ -d "${LKL_SRC}/.git" ]; then
+    lkl_commit=$(git -C "${LKL_SRC}" rev-parse HEAD 2> /dev/null || echo unknown)
+elif [ -f "${LKL_SRC}/BASELINE" ]; then
+    lkl_commit=$(awk -F= '$1 == "commit" { print $2; exit }' "${LKL_SRC}/BASELINE")
+fi
+
 printf 'commit=%s\ndate=%s\narch=%s\n' \
-    "$(git -C "${LKL_SRC}" rev-parse HEAD)" \
+    "${lkl_commit}" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     "${ARCH}" \
     > "${LKL_DIR}/BUILD_INFO"

@@ -16,6 +16,8 @@ Order of execution: `pre-commit`, then `commit-msg`, then `post-commit`.
 
 All checks below block the commit unless marked as a warning. Checks that read
 C source only see newly added lines, with string literals and comments removed.
+Staged paths under `vendor/` are exempt from every check: vendored code is
+third-party and is not held to these rules.
 
 | Check | Restriction |
 |---|---|
