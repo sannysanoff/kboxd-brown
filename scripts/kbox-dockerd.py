@@ -7,6 +7,7 @@ Docker Compose v5.x) over TCP (--host 0.0.0.0:2375) and/or Unix socket.
 """
 
 import argparse
+import base64
 import faulthandler
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -60,6 +61,53 @@ class _StripAuthOnCrossHostRedirect(urllib.request.HTTPRedirectHandler):
 
 
 _SAME_ORIGIN_OPENER = urllib.request.build_opener(_StripAuthOnCrossHostRedirect)
+
+
+def load_registry_auth(path=None):
+    """Read registry credentials from a docker config.json.
+
+    Only the flat `auths` map is read. ECR hands out a short-lived basic
+    credential (`AWS:<token>`) that the registry accepts directly on /v2/, so a
+    username/password pair per registry host is all that is needed — no
+    credential helpers, no SigV4. The file is optional: an install without one
+    keeps the previous anonymous-plus-token behaviour.
+    """
+    candidates = []
+    if path:
+        candidates.append(path)
+    else:
+        env = os.environ.get("KBOX_DOCKER_CONFIG", "")
+        if env:
+            candidates.append(env)
+        candidates.append(os.path.expanduser("~/.docker/config.json"))
+    for cand in candidates:
+        try:
+            with open(cand, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        auths = cfg.get("auths") or {}
+        out = {}
+        for host, entry in auths.items():
+            if not isinstance(entry, dict):
+                continue
+            user = entry.get("username") or entry.get("Username")
+            pw = entry.get("password") or entry.get("Password")
+            tok = entry.get("identitytoken") or entry.get("IdentityToken")
+            if user is not None and pw is not None:
+                out[host] = ("basic", f"{user}:{pw}")
+            elif entry.get("auth"):
+                try:
+                    dec = base64.b64decode(entry["auth"]).decode("utf-8")
+                except (ValueError, TypeError):
+                    continue
+                if ":" in dec:
+                    out[host] = ("basic", dec)
+            elif tok:
+                out[host] = ("bearer", tok)
+        if out:
+            return out
+    return {}
 
 
 
@@ -309,6 +357,9 @@ class ImageStore:
         # order. The mirror answers /v2/<repo>/... exactly like a registry, so a
         # pull turns into one more registry the layer cache can be filled from.
         self.registry_mirrors = []
+        # host -> ("basic", "user:pass") | ("bearer", token), loaded from a
+        # docker config.json when one is configured. Empty means anonymous.
+        self.registry_auth = {}
         self._sweep_partials()
         self._load_tags()
 
@@ -458,8 +509,42 @@ class ImageStore:
             return "registry-1.docker.io", f"library/{repo}"
         return "registry-1.docker.io", repo
 
+    # Hosts that mean Docker Hub, whatever spelling the config used. A config
+    # written by `docker login` keys it as index.docker.io, while pulls resolve
+    # to registry-1.docker.io — without this the credential never matched.
+    _HUB_HOSTS = {"index.docker.io", "registry-1.docker.io", "docker.io",
+                  "registry.hub.docker.com"}
+
+    def _auth_for(self, url):
+        """Pick the stored credential whose registry host serves this URL."""
+        if not self.registry_auth:
+            return None
+        netloc = urllib.parse.urlsplit(url).netloc
+        if netloc in self.registry_auth:
+            return self.registry_auth[netloc]
+        is_hub = netloc in self._HUB_HOSTS
+        for key, cred in self.registry_auth.items():
+            khost = urllib.parse.urlsplit(
+                key if "://" in key else "https://" + key
+            ).netloc
+            if khost and (khost == netloc or (is_hub and khost in self._HUB_HOSTS)):
+                return cred
+        return None
+
     def _http_get_with_auth(self, url, headers=None, token_cache=None):
         hdrs = dict(headers or {})
+        cred = self._auth_for(url)
+        if cred and not (token_cache and token_cache.get("token")):
+            kind, value = cred
+            # A registry that takes a username/password (ECR does, with
+            # `AWS:<ecr-token>`) is answered before the OAuth2 dance: its 401
+            # advertises `Basic realm=...` with no token endpoint, so trying the
+            # credential first is both simpler and the only path that works.
+            hdrs["Authorization"] = (
+                "Basic " + base64.b64encode(value.encode("utf-8")).decode("ascii")
+                if kind == "basic"
+                else "Bearer " + value
+            )
         if token_cache and token_cache.get("token"):
             hdrs["Authorization"] = f"Bearer {token_cache['token']}"
         req = urllib.request.Request(url, headers=hdrs)
@@ -469,6 +554,11 @@ class ImageStore:
             if e.code != 401:
                 raise
             www = e.headers.get("WWW-Authenticate", "")
+            # A basic-auth registry has no realm to exchange: re-sending the same
+            # credential would only repeat the 401, so fail here instead of
+            # looping through a token endpoint that does not exist.
+            if cred and cred[0] == "basic" and "basic" in www.lower():
+                raise
             m_realm = re.search(r'realm="([^"]+)"', www)
             if not m_realm:
                 raise
@@ -1666,6 +1756,7 @@ class DockerEngineState:
             "env": env,
             "workdir": workdir,
             "tty": tty,
+            "attach_stdin": bool(body.get("AttachStdin", False)),
             "attach_stdout": bool(body.get("AttachStdout", True)),
             "attach_stderr": bool(body.get("AttachStderr", True)),
             "running": False,
@@ -1673,6 +1764,7 @@ class DockerEngineState:
             "exit_code": 0,
             "pid": 0,
             "log_path": f"/tmp/kboxd-logs/exec-{eid}.log",
+            "stdin_path": "",
             "done_ev": threading.Event(),
         }
         with self.lock:
@@ -1691,14 +1783,17 @@ class DockerEngineState:
         e["done_ev"].set()
 
     def start_exec(self, e):
-        resp = self.rpc.call({
+        payload = {
             "op": "exec_start",
             "exec_id": e["id"],
             "container_id": e["container_id"],
             "cmd": e["cmd"],
             "env": e["env"],
             "workdir": e["workdir"],
-        })
+        }
+        if e.get("stdin_path"):
+            payload["stdin_path"] = e["stdin_path"]
+        resp = self.rpc.call(payload)
         e["pid"] = resp.get("pid", 0)
         e["log_path"] = resp.get("log_path", e["log_path"])
         e["running"] = True
@@ -2419,8 +2514,19 @@ class DockerHandler(BaseHTTPRequestHandler):
             if not e:
                 self.send_json(404, {"message": f"No such exec instance: {eid}"})
                 return
-            body = self._read_json()
-            self._handle_exec_start(e, body)
+            # The body is EITHER the start options (JSON) OR, for an exec
+            # created with AttachStdin, the stdin payload itself. A non-JSON
+            # body must be kept, not dropped: reading it as JSON would swallow
+            # the caller's bytes and leave the process with an empty stdin.
+            raw = self._read_body()
+            body = {}
+            if raw:
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                    raw = b""
+                except (ValueError, UnicodeDecodeError):
+                    body = {}
+            self._handle_exec_start(e, body, raw)
             return
 
         m = re.match(r"^/(containers|exec)/([^/]+)/resize$", path)
@@ -2565,7 +2671,48 @@ class DockerHandler(BaseHTTPRequestHandler):
                 break
             time.sleep(0.05)
 
-    def _stream_upgrade_or_chunked(self, log_path, tty, show_out, show_err, is_exited_fn):
+    def _pump_stdin(self, fifo, raw_stdin, exec_rec):
+        """Feed the exec's stdin: the bytes already read, then the live socket.
+
+        Runs in its own thread because the request handler is busy streaming the
+        output. Opening the FIFO for writing blocks until the guest opens it for
+        reading — that is the synchronisation with process start, no sleep.
+        """
+        try:
+            with open(fifo, "wb", buffering=0) as w:
+                if raw_stdin:
+                    w.write(raw_stdin)
+                while True:
+                    chunk = self._read_stdin_chunk(exec_rec)
+                    if chunk is None:
+                        continue
+                    if not chunk:
+                        break
+                    try:
+                        w.write(chunk)
+                    except (BrokenPipeError, OSError):
+                        break
+        except (OSError, ValueError):
+            return
+
+    def _read_stdin_chunk(self, exec_rec, size=65536):
+        """One read from the hijacked connection: bytes, b"" at EOF, None on idle.
+
+        An idle stdin is normal (`exec -i` with a slow producer), so a timeout is
+        None — "keep the FIFO open and try again" — while b"" ends the pump and
+        closes the channel so the guest sees EOF.
+        """
+        sock = self.connection
+        try:
+            sock.settimeout(0.2)
+            return sock.recv(size)
+        except (socket.timeout, TimeoutError):
+            return b"" if exec_rec.get("exited") else None
+        except OSError:
+            return b""
+
+    def _stream_upgrade_or_chunked(self, log_path, tty, show_out, show_err, is_exited_fn,
+                                   stdin_fifo="", raw_stdin=b"", exec_rec=None):
         upgrade = self.headers.get("Upgrade", "").lower() == "tcp"
         ctype = "application/vnd.docker.raw-stream" if tty else "application/vnd.docker.multiplexed-stream"
 
@@ -2576,6 +2723,13 @@ class DockerHandler(BaseHTTPRequestHandler):
             self.send_header("Upgrade", "tcp")
             self.send_header("Content-Type", ctype)
             self.end_headers()
+
+            if stdin_fifo:
+                threading.Thread(
+                    target=self._pump_stdin,
+                    args=(stdin_fifo, raw_stdin, exec_rec or {}),
+                    daemon=True,
+                ).start()
 
             def write_raw(b):
                 self.wfile.write(b)
@@ -2626,11 +2780,38 @@ class DockerHandler(BaseHTTPRequestHandler):
         finally:
             c["attach_count"] = c.get("attach_count", 1) - 1
 
-    def _handle_exec_start(self, e, body):
+    def _handle_exec_start(self, e, body, raw_stdin=b""):
         eng = self.server.engine
         detach = bool(body.get("Detach", False))
         tty = bool(body.get("Tty", e["tty"]))
         e["tty"] = tty
+        # `docker exec -i` puts the caller's bytes on the connection AFTER the
+        # 101 handshake, so the process must start with a live channel, not a
+        # finished file. A FIFO gives kboxd's guest a blocking read, and this
+        # side pumps the socket into it while it streams the output back.
+        e["stdin_fifo"] = ""
+        if e.get("attach_stdin") and not detach:
+            # A per-exec FIFO under the STATE dir, not /tmp/kboxd-logs: that
+            # directory is root-owned (created when the daemon ran as root) and
+            # mkfifo there fails with EACCES while the shim runs as the role
+            # user. state_dir belongs to whoever runs the shim.
+            fifo_dir = os.path.join(eng.state_dir, "stdin")
+            try:
+                os.makedirs(fifo_dir, exist_ok=True)
+            except OSError:
+                pass
+            fifo = os.path.join(fifo_dir, f"exec-{e['id']}.fifo")
+            try:
+                os.unlink(fifo)
+            except OSError:
+                pass
+            try:
+                os.mkfifo(fifo, 0o600)
+                e["stdin_fifo"] = fifo
+                e["stdin_path"] = fifo
+            except OSError as exc:
+                sys.stderr.write(f"[dockerd] stdin fifo: {exc}\n")
+                sys.stderr.flush()
         try:
             eng.start_exec(e)
         except Exception as exc:
@@ -2649,6 +2830,9 @@ class DockerHandler(BaseHTTPRequestHandler):
             e["attach_stdout"],
             e["attach_stderr"],
             lambda: e["exited"],
+            stdin_fifo=e.get("stdin_fifo") or "",
+            raw_stdin=raw_stdin,
+            exec_rec=e,
         )
         e["done_ev"].wait(timeout=2.0)
         try:
@@ -2656,6 +2840,13 @@ class DockerHandler(BaseHTTPRequestHandler):
                 os.unlink(e["log_path"])
         except OSError:
             pass
+        # The FIFO is per-exec and dead once the pump finished; an unlinked
+        # fifo keeps no bytes, so this only stops the directory filling up.
+        if e.get("stdin_fifo"):
+            try:
+                os.unlink(e["stdin_fifo"])
+            except OSError:
+                pass
 
     def _handle_events(self, qs):
         filters = (qs.get("filters") or [None])[0]
@@ -2738,6 +2929,8 @@ def main():
     ap.add_argument("--registry-mirror", action="append", default=[],
                     help="Pull-through mirror host[:port] tried before the upstream registry")
     ap.add_argument("--import-dir", action="append", default=[], help="Pre-import host dir as REF=DIR")
+    ap.add_argument("--docker-config", default="",
+                    help="Path to a docker config.json whose `auths` are used for registry pulls")
     ap.add_argument("--path-map", action="append", default=[], help="Rewrite bind path HOST_PREFIX:LOCAL_PREFIX")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
@@ -2759,6 +2952,10 @@ def main():
 
     engine = DockerEngineState(rpc, args.state_dir, path_maps=path_maps, config_path=args.config)
     engine.images.registry_mirrors = list(args.registry_mirror or [])
+    engine.images.registry_auth = load_registry_auth(args.docker_config or None)
+    if engine.images.registry_auth:
+        print("[dockerd] registry credentials loaded for: "
+              + ", ".join(sorted(engine.images.registry_auth)), flush=True)
 
     for imp in args.import_dir:
         if "=" in imp:

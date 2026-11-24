@@ -89,6 +89,11 @@ struct daemon_proc_env {
     int cmd_count;
     char *const *env;
     int env_count;
+    /* A file whose contents become the process's stdin, or NULL for /dev/null.
+     * `docker exec -i` needs this: the HTTP body the caller streams is spooled
+     * to a file first, because nothing on the host side can stay attached to a
+     * guest descriptor once the request handler returns. */
+    const char *stdin_path;
     /* The address this container is known by on the pod network. A connect
      * aimed at it must not leave the container, or it comes back in through
      * the host forwarder and deadlocks against itself. */
@@ -150,6 +155,9 @@ struct daemon_exec {
     char container_id[80];
     char workdir[PATH_MAX];
     char log_path[160];
+    /* Spooled stdin for `docker exec -i`, empty when the caller sent none. */
+    char stdin_path[160];
+    char stdin_file[180];
 
     char *cmd[MAX_CMD_ARGS + 1];
     int cmd_count;
@@ -1594,6 +1602,47 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
         return -1;
     }
     int devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    /* stdin comes from a FIFO when the caller attached one. Opened
+     * NON-blocking first so a reader that arrives before the writer still gets
+     * a descriptor, then switched back to blocking so reads wait for bytes
+     * instead of returning EOF immediately.
+     *
+     * A FIFO, not a regular file: `docker exec -i` streams stdin AFTER the 101
+     * handshake, so the bytes do not exist yet when the process starts. A plain
+     * file would hand the guest an instant EOF and `cat > f` would write
+     * nothing while still exiting 0. */
+    int stdin_fd = devnull;
+    if (pe->stdin_path && pe->stdin_path[0]) {
+        stdin_fd = open(pe->stdin_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (stdin_fd < 0) {
+            fprintf(stderr, "kboxd: open stdin %s: %s\n", pe->stdin_path,
+                    strerror(errno));
+            goto stdin_failed;
+        }
+        int fl = fcntl(stdin_fd, F_GETFL);
+        if (fl >= 0)
+            fcntl(stdin_fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+    goto stdin_ok;
+
+stdin_failed:
+    close(log_fd);
+    if (devnull >= 0)
+        close(devnull);
+    close(out_p[0]);
+    close(out_p[1]);
+    close(err_p[0]);
+    close(err_p[1]);
+    close(sp[0]);
+    close(sp[1]);
+    close(exec_memfd);
+    if (interp_memfd >= 0)
+        close(interp_memfd);
+    free_str_vec(exec_argv);
+    hooks->on_failed(hooks->opaque, "stdin pipe is not readable");
+    return -1;
+
+stdin_ok:
 
     *hooks->exit_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     __atomic_store_n(hooks->exit_status, -1, __ATOMIC_RELEASE);
@@ -1602,13 +1651,15 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
-        if (devnull >= 0)
-            dup2(devnull, STDIN_FILENO);
+        if (stdin_fd >= 0)
+            dup2(stdin_fd, STDIN_FILENO);
         dup2(out_p[1], STDOUT_FILENO);
         dup2(err_p[1], STDERR_FILENO);
 
         if (devnull > 2)
             close(devnull);
+        if (stdin_fd > 2 && stdin_fd != devnull)
+            close(stdin_fd);
         close(sp[0]);
         close(out_p[0]);
         close(out_p[1]);
@@ -1654,6 +1705,8 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
 
     if (devnull >= 0)
         close(devnull);
+    if (stdin_fd > 2 && stdin_fd != devnull)
+        close(stdin_fd);
     close(sp[1]);
     close(out_p[1]);
     close(err_p[1]);
@@ -2337,6 +2390,7 @@ static void *exec_worker_thread(void *arg)
         .cmd_count = e->cmd_count,
         .env = e->env,
         .env_count = e->env_count,
+        .stdin_path = e->stdin_file[0] ? e->stdin_file : NULL,
         .own_ip = c->ip,
         .host_net = c->host_net,
         .mem_limit = c->mem_limit,
@@ -2395,6 +2449,11 @@ static struct daemon_exec *find_exec_locked(const char *exec_id)
 
 static void free_exec_fields(struct daemon_exec *e)
 {
+    /* The stdin spool belongs to this exec alone: nothing else reads it after
+     * the guest process is gone, and leaving it behind leaks a file per
+     * `docker exec -i` under the log dir. */
+    if (e->stdin_file[0])
+        unlink(e->stdin_file);
     free_str_vec(e->cmd);
     e->cmd_count = 0;
     free_str_vec(e->env);
@@ -2781,6 +2840,15 @@ static void handle_rpc_line(int client_fd, const char *req)
                  tc->id);
         snprintf(eslot->log_path, sizeof(eslot->log_path), "%s/exec-%s.log",
                  g_config.log_dir[0] ? g_config.log_dir : DAEMON_LOG_DIR, eid);
+        /* `docker exec -i`: the frontend spools the request body to this path
+         * before starting the exec, because the guest reads its stdin from a
+         * host file it can seek and re-read, not from a live socket. */
+        if (json_get_str(req, "stdin_path", eslot->stdin_path,
+                         sizeof(eslot->stdin_path)) == 0 &&
+            eslot->stdin_path[0]) {
+            snprintf(eslot->stdin_file, sizeof(eslot->stdin_file), "%s",
+                     eslot->stdin_path);
+        }
 
         if (json_get_str(req, "workdir", wd, sizeof(wd)) == 0 && wd[0])
             snprintf(eslot->workdir, sizeof(eslot->workdir), "%s", wd);
