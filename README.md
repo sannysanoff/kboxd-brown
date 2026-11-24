@@ -31,7 +31,7 @@ or [`ptrace`](https://man7.org/linux/man-pages/man2/ptrace.2.html).
 
 ## Baseline for this brown slopware
 
-This brown vibeware is based on the original
+This brown slopware is based on the original
 [`sysprog21/kbox`](https://github.com/sysprog21/kbox) project. The kbox sources
 are a re-import with their git history dropped, and the LKL tree from
 [`lkl/linux`](https://github.com/lkl/linux) is vendored by value in `vendor/lkl`.
