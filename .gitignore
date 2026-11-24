@@ -31,3 +31,6 @@ tests/lkl/hostfs-test
 artifacts/
 
 build/sqllogictest
+
+# Emitted by the ARCH=lkl link step inside the vendored LKL tree.
+vendor/lkl/arch/lkl/kernel/vmlinux-fuzzing-postlink.lds
