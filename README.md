@@ -139,18 +139,17 @@ trade-offs and selection rules.
 
 ## Baseline for this brown slopware
 
-This tree is a re-import of `sannysanoff/kbox` with LKL vendored by value in
-`vendor/lkl`. It starts from these commits:
+This tree starts from two original projects. LKL is vendored by value in
+`vendor/lkl`; the kbox sources are a re-import with their git history dropped.
 
 | Component | Repository | Commit | Commit date |
 |---|---|---|---|
-| kbox | [`sannysanoff/kbox`](https://github.com/sannysanoff/kbox) | `2ce27357aa3ec3c1f120ff1c6cf4b683a07a8216` | 2026-11-23 23:26:54 +0000 |
+| kbox base | [`sysprog21/kbox`](https://github.com/sysprog21/kbox) | `86df60a932c826fc147db0a79c2bc5ecd6397f04` | 2026-04-29 08:49:13 +0000 |
 | LKL base | [`lkl/linux`](https://github.com/lkl/linux) | `d0f76a77e8c2ca68bd7d96190b8da09040eab072` | 2026-09-28 21:44:38 +0000 |
-| LKL patches | [`sannysanoff/linux`](https://github.com/sannysanoff/linux) | `9265c16bf64da88a5b9a3165abd7c10434a84059` | 2026-11-20 15:12:26 +0100 |
 
-`sannysanoff/kbox` is an original project and not a fork. `sannysanoff/linux`
-is a GitHub fork of `lkl/linux`: the vendored tree is the `lkl/linux` commit
-plus the five fork commits below.
+The kbox sources carry 294 commits on top of the kbox base. The vendored LKL
+tree carries five hostfs and overlayfs patches on top of the LKL base; they
+live in `vendor/lkl` and are not part of the upstream history.
 
 | Commit | Subject |
 |---|---|
@@ -161,8 +160,8 @@ plus the five fork commits below.
 | `9265c16bf6` | hostfs: stop unlocking a new inode in tmpfile |
 
 `vendor/lkl` is that tree copied without git metadata, so a checkout of this
-repository builds the same kernel the upstream projects build. `make` reads
-the tree in place; nothing is cloned and nothing is checked out.
+repository builds the same kernel. `make` reads the tree in place; nothing is
+cloned and nothing is checked out.
 
 `vendor/` is exempt from the repository hooks: formatting, whitespace and C
 safety checks see kbox's own sources only.

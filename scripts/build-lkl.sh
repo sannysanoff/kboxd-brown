@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# Build liblkl.a from the vendored LKL tree (vendor/lkl, a copy of
-# sannysanoff/linux, a fork of lkl/linux) and populate lkl-<ARCH>/.
+# Build liblkl.a from the vendored LKL tree (vendor/lkl, based on lkl/linux
+# with the hostfs and overlayfs patches kbox requires) and populate lkl-<ARCH>/.
 #
 # Usage: ./scripts/build-lkl.sh [ARCH]
 #   ARCH defaults to the host architecture (x86_64 or aarch64).
@@ -26,14 +26,14 @@ LKL_SRC="${LKL_SRC:-vendor/lkl}"
 # ---- Kernel-side requirements -------------------------------------------
 
 # hostfs (the host directory filesystem) and the overlayfs fix that makes an
-# unprivileged upper understand its xattr whiteouts live in the fork:
+# unprivileged upper understand its xattr whiteouts are carried in vendor/lkl:
 #
 #   4710939b6 overlayfs: honour userxattr whiteouts in the upper layer
 #   ba619e886 hostfs: support xattrs, tmpfiles and unprivileged whiteouts
 #
 # Nothing is patched here: the vendored tree is built as committed.
 #
-# The only difference from sannysanoff/linux is that names differing only in
+# The only difference from the upstream tree is that names differing only in
 # case are present once, under the lowercase spelling (netfilter target/match
 # pairs and one litmus test). A case-insensitive filesystem cannot hold both,
 # and every removed spelling belongs to a config that is off in kbox's LKL

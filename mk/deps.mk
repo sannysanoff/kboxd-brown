@@ -2,8 +2,8 @@
 
 # liblkl.a is built from source on first use: the LKL tree vendored at
 # vendor/lkl is compiled and the library is reused from then on. It is a plain
-# copy of sannysanoff/linux without git metadata, so nothing is cloned or
-# checked out. Override LKL_SRC to build another tree. FORCE_LKL_BUILD=1
+# copy of the LKL tree kbox tracks, based on lkl/linux, without git metadata,
+# so nothing is cloned or checked out. Override LKL_SRC to build another tree. FORCE_LKL_BUILD=1
 # re-runs the build on every invocation so the sub-make inside it can pick up
 # source changes.
 

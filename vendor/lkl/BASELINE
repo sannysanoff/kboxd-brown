@@ -1,9 +1,11 @@
 # Baseline for this brown slopware: the LKL tree vendored in this directory.
 #
-# Copied by value from sannysanoff/linux, a fork of lkl/linux. The copy holds
-# no git metadata; scripts/build-lkl.sh builds it in place.
-repository=https://github.com/sannysanoff/linux
-branch=master
+# Copied by value without git metadata; scripts/build-lkl.sh builds it in
+# place. The base is lkl/linux with five hostfs and overlayfs patches on top,
+# which kbox requires. commit= is the tip of that patch series.
+upstream-repository=https://github.com/lkl/linux
+upstream-commit=d0f76a77e8c2ca68bd7d96190b8da09040eab072
+upstream-date=2026-09-28T21:44:38Z
 commit=9265c16bf64da88a5b9a3165abd7c10434a84059
 date=2026-11-20T15:12:26+01:00
 
