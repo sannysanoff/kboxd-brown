@@ -1567,8 +1567,46 @@ struct kbox_dispatch forward_getsockopt(const struct kbox_syscall_request *req,
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = resolve_lkl_socket(ctx, fd);
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
-        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd)))
+        (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))) {
+        /* SO_PEERCRED on a host-passthrough socket (every AF_UNIX one is: LKL
+         * has no unix sockets) is answered by the HOST kernel, which reports the
+         * host owner of the peer -- the role user, uid 1000 -- while the guest
+         * believes it is uid 0. A guest-side peer check then sees a stranger:
+         * hermes refuses its own gateway with "unsafe_control_peer" and every
+         * agent run dies before its first model call.
+         *
+         * Report the identity the guest would present. The opposite rewrite
+         * already exists in sendmsg, which turns SCM_CREDENTIALS into host
+         * credentials so the host kernel accepts them. */
+        if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY) {
+            long level = to_c_long_arg(kbox_syscall_request_arg(req, 1));
+            long optname = to_c_long_arg(kbox_syscall_request_arg(req, 2));
+            uint64_t optval_ptr = kbox_syscall_request_arg(req, 3);
+            uint64_t optlen_ptr = kbox_syscall_request_arg(req, 4);
+
+            if (level == SOL_SOCKET && optname == SO_PEERCRED &&
+                optval_ptr != 0 && optlen_ptr != 0) {
+                pid_t pid = kbox_syscall_request_pid(req);
+                unsigned int optlen = 0;
+                if (guest_mem_read(ctx, pid, optlen_ptr, &optlen,
+                                   sizeof(optlen)) >= 0 &&
+                    optlen >= sizeof(struct ucred)) {
+                    struct ucred uc;
+                    memset(&uc, 0, sizeof(uc));
+                    uc.uid = ctx->root_identity ? 0 : (uint32_t) getuid();
+                    uc.gid = ctx->root_identity ? 0 : (uint32_t) getgid();
+                    if (guest_mem_write(ctx, pid, optval_ptr, &uc, sizeof(uc)) >=
+                        0) {
+                        unsigned int out_len = sizeof(uc);
+                        (void) guest_mem_write(ctx, pid, optlen_ptr, &out_len,
+                                               sizeof(out_len));
+                        return kbox_dispatch_value(0);
+                    }
+                }
+            }
+        }
         return kbox_dispatch_continue();
+    }
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
 
