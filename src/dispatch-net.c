@@ -1646,6 +1646,13 @@ struct kbox_dispatch forward_getsockopt(const struct kbox_syscall_request *req,
 
         (void) resolve_lkl_socket_entry(ctx, fd, &entry);
         memcpy(&so_error, optval, sizeof(so_error));
+        if (getenv("KBOX_SOERR_TRACE"))
+            fprintf(stderr,
+                    "kbox: soerr fd=%ld lkl=%ld entry=%p shadow=%d err=%d conn=%d est=%d\n",
+                    fd, lkl_fd, (void *) entry,
+                    entry ? (int) entry->shadow_sp : -1, so_error,
+                    entry ? (int) entry->sock_connected : -1,
+                    entry ? (int) entry->sock_established : -1);
         if (so_error == 0) {
             int pumped_err = kbox_net_take_lkl_error((int) lkl_fd);
 
@@ -1657,33 +1664,66 @@ struct kbox_dispatch forward_getsockopt(const struct kbox_syscall_request *req,
             (void) kbox_net_take_lkl_error((int) lkl_fd);
         }
         if (entry && entry->shadow_sp >= 0) {
+            /* SO_ERROR must answer for the state the guest is asking about, and
+             * "in flight" is a state, not an outcome. The guest that drives a
+             * connect through epoll -- asyncio, anyio, httpx, so every hermes
+             * model call -- reads SO_ERROR once, after writability, and takes
+             * ANY non-zero value as the connect failure. A single failed
+             * getpeername() here used to answer EINPROGRESS and tear the entry
+             * down, so that guest saw "[Errno 115] Operation now in progress"
+             * and could never reach the model, while a blocking connect (which
+             * the connect path finishes itself) worked.
+             *
+             * Finish the handshake here instead, waiting the same bounded way
+             * the blocking path does: 0 or the real error, never a spurious
+             * EINPROGRESS. */
             if (so_error == 0 && entry->sock_connected &&
                 !entry->sock_established) {
-                /* The kernel keeps no error while a connect is still in
-                 * flight, so SO_ERROR reads 0 before the handshake has
-                 * finished. A guest following the poll+SO_ERROR protocol then
-                 * believes the connection is up and writes its request into a
-                 * socket that is still connecting; the mariadb client did
-                 * exactly that and reported "Lost connection to server at
-                 * 'handshake: reading initial communication packet', system
-                 * error: 115" for up to 108 of 200 loopback connects, with
-                 * plain Docker completing all 200. Answer for the state the
-                 * guest is asking about: pending until a peer exists. */
                 struct sockaddr_storage peer;
                 socklen_t plen = sizeof(peer);
+                int done = 0;
 
-                if (kbox_lkl_getpeername(ctx->sysnrs, lkl_fd, &peer, &plen) <
-                    0) {
-                    so_error = EINPROGRESS;
-                    memcpy(optval, &so_error, sizeof(so_error));
-                } else {
-                    entry->sock_established = 1;
+                for (int attempt = 0; attempt < 1200; attempt++) {
+                    int pumped_err;
+
+                    plen = sizeof(peer);
+                    if (kbox_lkl_getpeername(ctx->sysnrs, lkl_fd, &peer,
+                                             &plen) == 0) {
+                        entry->sock_established = 1;
+                        done = 1;
+                        break;
+                    }
+                    pumped_err = kbox_net_take_lkl_error((int) lkl_fd);
+                    if (pumped_err > 0 && pumped_err != EINPROGRESS &&
+                        pumped_err != EALREADY && pumped_err != EAGAIN) {
+                        so_error = pumped_err;
+                        entry->sock_connected = 0;
+                        entry->sock_established = 0;
+                        entry->sock_peer_family = 0;
+                        done = 1;
+                        break;
+                    }
+                    {
+                        struct pollfd wp = {
+                            .fd = (int) lkl_fd,
+                            .events = POLLOUT,
+                            .revents = 0,
+                        };
+                        struct timespec wts = {0, 2 * 1000 * 1000};
+
+                        (void) kbox_lkl_ppoll(ctx->sysnrs, &wp, 1, &wts, NULL,
+                                              0);
+                    }
                 }
-            } else if (so_error != 0) {
+                if (!done)
+                    so_error = EINPROGRESS;
+                memcpy(optval, &so_error, sizeof(so_error));
+            } else if (so_error != 0 && so_error != EINPROGRESS &&
+                       so_error != EALREADY) {
                 entry->sock_connected = 0;
                 entry->sock_established = 0;
                 entry->sock_peer_family = 0;
-            } else {
+            } else if (so_error == 0) {
                 entry->sock_established = 1;
             }
         }
