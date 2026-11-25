@@ -10716,31 +10716,6 @@ static struct kbox_dispatch dispatch_request_impl(
 
     if (nr == h->clone) {
         uint64_t cflags = kbox_syscall_request_arg(req, 0);
-        /* Refuse the vfork form (CLONE_VM|CLONE_VFORK) so libc falls back to
-         * plain fork().
-         *
-         * An exec from such a child rewrites the pathname inside memory the
-         * PARENT shares, and the parent is resumed with a best-effort restore
-         * of the bytes that were overwritten. That restore does not cover
-         * everything the stalled parent left in registers, caches or its own
-         * stack, so the parent can resume with corrupted state — CPython dies
-         * with SIGSEGV on its first subprocess.run(), which is every agent
-         * tool call, and the crash site moves between runs (_try_wait,
-         * Py_RunMain, a logging thread) because the damage is to memory, not
-         * to one call.
-         *
-         * Linux explicitly allows implementing vfork as fork, and callers must
-         * behave identically without it, so ENOSYS here costs a page-table
-         * copy and buys correctness. CLONE_VM alone (pthread_create) is
-         * untouched: only the combination is refused. */
-        if ((cflags & (CLONE_VM | CLONE_VFORK)) == (CLONE_VM | CLONE_VFORK)) {
-            if (ctx->verbose)
-                fprintf(stderr,
-                        "kbox: clone: vfork form refused, caller falls back to "
-                        "fork (pid=%u)\n",
-                        kbox_syscall_request_pid(req));
-            return kbox_dispatch_errno(ENOSYS);
-        }
         if (getenv("KBOX_TRACE"))
             fprintf(stderr, "kbox: clone pid=%u flags=%#llx\n",
                     kbox_syscall_request_pid(req), (unsigned long long) cflags);
