@@ -3909,14 +3909,38 @@ int try_writeback_shadow_open(struct kbox_supervisor_ctx *ctx,
      * append on the LKL file let the other shadow's writeback overwrite the
      * appended bytes, so a write through one descriptor disappeared when the
      * other was closed (test_io's threaded writers).
+     *
+     * Such a shadow is built from a READ-ONLY sibling of this open, because
+     * filling it means pread(2) on the source and an O_WRONLY fd cannot be
+     * read. Without it the descriptor stays purely virtual, which only breaks
+     * once it is dup2'd onto 0/1/2: the guest then holds a number with no host
+     * descriptor behind it, and a shell that forks for its command
+     * substitution (dash -- /bin/sh in every role image) writes the result to
+     * the wrong channel or fails with EBADF. A dispatched run's answer landed
+     * in .err that way while .out, which supervisord reads, stayed empty.
      */
     if (memfd < 0 && (flags & O_APPEND)) {
-        if (getenv("KBOX_FD_TRACE"))
-            fprintf(stderr,
-                    "kbofdt: wb_open lkl=%ld path=%s: append with no shadow, "
-                    "staying on the LKL file\n",
-                    lkl_fd, translated);
-        return 0;
+        long ro_fd = kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX, translated,
+                                     O_RDONLY, 0);
+
+        if (ro_fd >= 0) {
+            memfd = kbox_shadow_create_resilient(ctx, ro_fd);
+            (void) kbox_lkl_close(ctx->sysnrs, ro_fd);
+        }
+        if (memfd < 0) {
+            if (getenv("KBOX_FD_TRACE"))
+                fprintf(stderr,
+                        "kbofdt: wb_open lkl=%ld path=%s: append with no "
+                        "readable sibling, staying on the LKL file\n",
+                        lkl_fd, translated);
+            return 0;
+        }
+        /* The shadow carries the file as it was; O_TRUNC on an append open is
+         * legal and must still empty it. */
+        if ((flags & O_TRUNC) && ftruncate(memfd, 0) < 0) {
+            close(memfd);
+            return 0;
+        }
     }
     if (memfd < 0)
         memfd = kbox_shadow_create_resilient(ctx, lkl_fd);
