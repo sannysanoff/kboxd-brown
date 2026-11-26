@@ -861,5 +861,79 @@ class TestLayerCache(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(rootfs, "dir", "old")))
 
 
+class TestNfsPlacement(unittest.TestCase):
+    """Exports stay declared in the engine config; containers receive subtrees."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.cfg = {
+            "start_ip": "172.18.0.2",
+            "gateway": "172.18.0.1",
+            "volumes_root": os.path.join(self.tmpdir.name, "volumes"),
+            "volumes_export": "nfs://persist/persists/pod-0/docker/volumes",
+            "mounts": {
+                "nfs://persist": {
+                    "source": "10.0.0.5:/export/seat",
+                    "options": "vers=4.2",
+                    "visible_at": "/persist",
+                    "sub": "persists/pod-0",
+                },
+                "nfs://common": {
+                    "source": "10.0.0.5:/export/seat",
+                    "options": "vers=4.2",
+                    "visible_at": "/common-volume",
+                },
+            },
+        }
+        self.engine = kbox_dockerd.DockerEngineState(
+            FakeRpc(self.tmpdir.name), self.tmpdir.name, config=self.cfg
+        )
+        self.img_src = os.path.join(self.tmpdir.name, "rootfs")
+        os.makedirs(os.path.join(self.img_src, "bin"), exist_ok=True)
+        self.engine.images.import_dir_as_image("alpine:latest", self.img_src)
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_bind_under_export_becomes_a_subtree_of_it(self):
+        # The agent lives on the export, so a compose file's relative bind
+        # (`./docker/data-monitor`) resolves inside it. Without the rewrite the
+        # daemon would look for a host path that does not exist.
+        self.assertEqual(
+            self.engine.export_for_guest_path("/persist/home/.cfg"),
+            "nfs://persist/persists/pod-0/home/.cfg",
+        )
+        self.assertIsNone(self.engine.export_for_guest_path("/etc/passwd"))
+
+    def test_named_volume_lives_on_the_export(self):
+        rec = self.engine.create_container(
+            "proj-1",
+            {
+                "Image": "alpine:latest",
+                "HostConfig": {"Mounts": [
+                    {"Type": "volume", "Source": "dbdata", "Target": "/data"},
+                ]},
+            },
+        )
+        mp = rec["mounts_json"][0]
+        self.assertEqual(mp["Source"],
+                         "nfs://persist/persists/pod-0/docker/volumes/dbdata/_data")
+        self.assertEqual(self.engine.volumes["dbdata"]["Driver"], "kbox-nfs")
+        # Only the metadata index may exist locally; the _data directory must not,
+        # or the container would write there and the export would stay empty.
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmpdir.name, "volumes", "dbdata", "_data")))
+
+    def test_subtree_volume_resolves_for_compose(self):
+        # compose validates an external volume with GET /volumes/<name>, so a
+        # derived subtree must answer or the project never starts.
+        for name in ("nfs://persist/persists/pod-0", "nfs://common"):
+            v = self.engine.resolve_volume(name)
+            self.assertIsNotNone(v, name)
+            self.assertEqual(v["Driver"], "kbox-nfs")
+            self.assertEqual(v["Mountpoint"], name)
+        self.assertIsNone(self.engine.resolve_volume("nfs://nowhere"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

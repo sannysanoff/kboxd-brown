@@ -164,7 +164,14 @@ int kbox_daemon_nfs_add(struct kbox_daemon_config *cfg,
         snprintf(m->source, sizeof(m->source), "%s", value);
     else if (strcmp(key, "options") == 0 || strcmp(key, "opts") == 0)
         snprintf(m->options, sizeof(m->options), "%s", value);
-    else
+    else if (strcmp(key, "visible_at") == 0 || strcmp(key, "sub") == 0) {
+        /* Client-side placement hints, read by the dockerd shim: which guest
+         * path the export occupies and which subtree of it that path is.
+         * Accepted here so the shim and the daemon can share one config file;
+         * the daemon itself always mounts the whole export and binds the
+         * subtrees a container asks for.
+         */
+    } else
         return -1;
     return 0;
 }

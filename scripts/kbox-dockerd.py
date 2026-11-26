@@ -147,6 +147,11 @@ def load_kbox_config(config_path=None):
         "start_ip": DEFAULT_START_IP,
         "gateway": "",
         "volumes_root": os.path.abspath(os.path.expanduser(DEFAULT_VOLUMES_ROOT)),
+        # mounts:<handle>: {source, options} — exports this daemon mounts for its
+        # whole lifetime. Published as external volumes under their handle name,
+        # so a container gets one ONLY by naming that volume; nothing here reaches
+        # a container that did not ask.
+        "mounts": {},
         "config_path": "",
         # Storage layout. Empty means "under the state directory".
         "blobs_dir": "",
@@ -159,6 +164,11 @@ def load_kbox_config(config_path=None):
     cfg["config_path"] = eff
     if eff and os.path.isfile(eff):
         section = ""
+        # The handle of the mount currently being described, e.g. "nfs://persist".
+        # A quoted key may carry a colon of its own, so the generic split below
+        # cannot be used for it.
+        mount_handle = ""
+        mount_indent = 0
         with open(eff, "r", encoding="utf-8") as f:
             for raw_line in f:
                 line = raw_line.split("#", 1)[0]
@@ -166,11 +176,54 @@ def load_kbox_config(config_path=None):
                 stripped = line.strip()
                 if not stripped or ":" not in stripped:
                     continue
-                key, val = stripped.split(":", 1)
-                key = key.strip()
-                val = val.strip()
+                # A quoted key may contain the separator, as every nfs:// handle
+                # does ("nfs://persist":) — so the closing quote, not the first
+                # colon, decides where the key ends.
+                if stripped[0] in ("'", '"'):
+                    close = stripped.find(stripped[0], 1)
+                    if close < 0:
+                        continue
+                    key = stripped[1:close]
+                    rest = stripped[close + 1:].lstrip()
+                    val = rest[1:] if rest.startswith(":") else ""
+                    val = val.strip()
+                else:
+                    key, val = stripped.split(":", 1)
+                    key = key.strip()
+                    val = val.strip()
                 if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
                     val = val[1:-1]
+                if section == "mounts":
+                    # Depth, not just "indented": the handle sits one level under
+                    # mounts: and its fields one deeper. `nfs://persist:` is a
+                    # handle line, `source:`/`options:` are fields of it.
+                    depth = (len(line) - len(line.lstrip(" \t"))) if indented else 0
+                    if depth <= mount_indent or not mount_handle:
+                        mount_handle = key
+                        mount_indent = depth if indented else 0
+                        cfg["mounts"][mount_handle] = {"source": "", "options": ""}
+                        if val:
+                            cfg["mounts"][mount_handle]["source"] = val
+                    else:
+                        entry = cfg["mounts"][mount_handle]
+                        if key in ("source", "server"):
+                            entry["source"] = val
+                        elif key in ("options", "opts"):
+                            entry["options"] = val
+                        elif key in ("visible_at", "visible-at", "at", "path"):
+                            # The guest path this export occupies inside a
+                            # container. Bind sources under it are rewritten to
+                            # the export, so a project's `./data:/app/data` and a
+                            # named volume both land on the export — while a
+                            # container that names nothing still gets nothing.
+                            entry["visible_at"] = val
+                        elif key in ("sub", "subpath", "sub_path"):
+                            # The subtree of the export this guest path stands
+                            # for: one box, one home. Relative binds inside a
+                            # container resolve here, not at the export root,
+                            # so two pods never share a home directory.
+                            entry["sub"] = val.strip("/")
+                    continue
                 if not indented and not val:
                     section = key
                     continue
@@ -188,6 +241,11 @@ def load_kbox_config(config_path=None):
                 elif (section in ("", "volumes")) and key in ("root", "volumes_root", "dir"):
                     if val:
                         cfg["volumes_root"] = os.path.abspath(os.path.expanduser(val))
+                elif section == "volumes" and key in ("export", "volumes_export"):
+                    # volumes.export: nfs:// handle to keep named volumes on the
+                    # durable export instead of the pod's ephemeral disk.
+                    if val:
+                        cfg["volumes_export"] = val
                 elif not section and key == "volumes_root" and val:
                     cfg["volumes_root"] = os.path.abspath(os.path.expanduser(val))
                 elif section == "storage" and key in ("images_dir", "images-dir"):
@@ -1099,8 +1157,13 @@ class DockerEngineState:
         self.execs = {}
         vol_cfg = self.config.get("volumes_root")
         self.vol_root = os.path.abspath(os.path.expanduser(vol_cfg)) if vol_cfg else os.path.join(state_dir, "volumes")
+        # Where named volumes keep their data. `volumes.export` names an nfs://
+        # handle (declared under mounts:) to put project volumes on the durable
+        # export instead of the pod's ephemeral disk.
+        self.vol_export = (self.config.get("volumes_export") or "").strip()
         os.makedirs(self.vol_root, exist_ok=True)
         self._load_persisted_volumes()
+        self.publish_declared_mounts()
         self._next_ephemeral_port = 20000
 
     @staticmethod
@@ -1119,10 +1182,21 @@ class DockerEngineState:
         return os.path.join(self.vol_root, vname, "meta.json")
 
     def _volume_data_dir(self, vname):
+        # Named volumes are a project's durable state (a DB, a cache). With an
+        # export configured they live ON it, so they survive the pod exactly like
+        # /persist does; the daemon creates the subtree on the export when the
+        # volume is first bound, and binds it into the container.
+        if self.vol_export:
+            return f"{self.vol_export.rstrip('/')}/{vname}/_data"
         return os.path.join(self.vol_root, vname, "_data")
 
     def _write_volume_meta(self, vname, vobj):
         meta_path = self._volume_meta_path(vname)
+        # The index stays on local disk even when the data lives on the export:
+        # metadata.db-like bookkeeping on a remote filesystem is slow and racy,
+        # and entrypoint.sh already keeps dockerd's own index local for the same
+        # reason. Only the volume's _data is remote.
+        os.makedirs(os.path.dirname(meta_path), exist_ok=True)
         tmp_path = f"{meta_path}.tmp.{os.getpid()}.{threading.get_ident()}"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(vobj, f, indent=2, sort_keys=True)
@@ -1170,9 +1244,25 @@ class DockerEngineState:
             self.volumes[entry] = vobj
 
     def ensure_volume(self, vname, labels=None, options=None, service=None):
+        # A derived nfs:// volume names a subtree of a declared export and may
+        # contain slashes, so it is resolved before the name is validated.
+        derived = self.nfs_volume(vname)
+        if derived:
+            return derived
         vname = self._validate_volume_name(vname)
+        # A declared export is already published under this name by
+        # publish_declared_mounts, and its Mountpoint is the nfs:// handle.
+        # Creating a directory for it under vol_root would shadow the export with
+        # an empty local dir: the container would write there, report success, and
+        # nothing would reach the server.
+        with self.lock:
+            published = self.volumes.get(vname)
+        if published and published.get("Driver") == "kbox-nfs":
+            return dict(published)
         data_dir = self._volume_data_dir(vname)
-        os.makedirs(data_dir, exist_ok=True)
+        on_export = is_nfs_source(data_dir)
+        if not on_export:
+            os.makedirs(data_dir, exist_ok=True)
         with self.lock:
             existing = self.volumes.get(vname)
             if existing:
@@ -1194,7 +1284,7 @@ class DockerEngineState:
                     merged_labels["com.docker.compose.service"] = service
                 vobj = {
                     "Name": vname,
-                    "Driver": "local",
+                    "Driver": "kbox-nfs" if on_export else "local",
                     "Mountpoint": data_dir,
                     "CreatedAt": rfc3339(time.time()),
                     "Labels": merged_labels,
@@ -1214,6 +1304,114 @@ class DockerEngineState:
             shutil.rmtree(vdir, ignore_errors=True)
             existed = True
         return existed
+
+    def publish_declared_mounts(self):
+        """Expose each config-declared export as a volume named after its handle.
+
+        The export is mounted for the daemon's whole lifetime — that is the
+        config's job. Handing it to containers is NOT: a volume exists, and a
+        container receives it only by naming it (compose: `external: true` with
+        `name: "nfs://persist"`). So a project's compose file gets exactly the
+        subdirectories it asks for, while the system stack that runs the agent
+        asks for the whole handle and gets the whole export.
+
+        Published volumes carry Mountpoint=nfs://... and Driver=kbox-nfs so the
+        mount path is never confused with a local directory: a container that
+        binds one must go through the daemon's NFS path, not a host path.
+        """
+        for handle, entry in (self.config.get("mounts") or {}).items():
+            if not handle or not entry.get("source"):
+                continue
+            # The published NAME is the handle's short form ("nfs://persist" ->
+            # "persist"): a volume name cannot contain a slash, so the handle
+            # itself is not a legal name. The handle lives in Mountpoint, and
+            # anything binding this volume goes through the NFS path because of
+            # it.
+            name = handle[len("nfs://"):] if handle.startswith("nfs://") else handle
+            name = name.strip("/").replace("/", "-")
+            if not name:
+                continue
+            with self.lock:
+                existing = self.volumes.get(name)
+                vobj = dict(existing or {})
+                vobj["Name"] = name
+                vobj["Driver"] = "kbox-nfs"
+                vobj["Mountpoint"] = handle
+                vobj.setdefault("CreatedAt", rfc3339(time.time()))
+                vobj.setdefault("Labels", {})
+                vobj.setdefault("Scope", "local")
+                vobj["Options"] = {
+                    **(vobj.get("Options") or {}),
+                    "source": entry.get("source", ""),
+                    "options": entry.get("options", ""),
+                }
+                self.volumes[name] = vobj
+
+    def nfs_volume(self, name):
+        """A synthetic volume for an nfs:// source, or None.
+
+        A compose file may name a SUBTREE of a declared export
+        (`name: "nfs://persist/persists/<pod>"`), which is how the agent gets its
+        own home while project containers get only their subdirectories. Such a
+        name is never published — it is derived — so `GET /volumes/<name>` and
+        `ensure_volume` must resolve it here, or compose rejects the external
+        volume as non-existent and never starts the service.
+        """
+        if not is_nfs_source(name):
+            return None
+        base = name[len("nfs://"):].split("/", 1)[0]
+        declared = (self.config.get("mounts") or {}).get("nfs://" + base)
+        # Only a DECLARED export can be handed out. Anything else is a typo in a
+        # compose file, and answering it with an empty volume would turn that typo
+        # into a container writing to nowhere while reporting success.
+        if not declared:
+            return None
+        return {
+            "Name": name,
+            "Driver": "kbox-nfs",
+            "Mountpoint": name,
+            "CreatedAt": rfc3339(time.time()),
+            "Labels": {},
+            "Scope": "local",
+            "Options": {"source": (declared or {}).get("source", ""),
+                        "options": (declared or {}).get("options", "")},
+        }
+
+    def resolve_volume(self, name):
+        """A declared or derived NFS volume by name, else None."""
+        with self.lock:
+            known = self.volumes.get(name)
+        if known:
+            return dict(known)
+        return self.nfs_volume(name)
+
+    def export_for_guest_path(self, path):
+        """The nfs:// handle an absolute guest path belongs to, or None.
+
+        An export declares `visible_at: /persist`, meaning that inside a container
+        it looks like a plain directory. Anything a compose file binds from under
+        it is really a subtree of the export, so the source has to become the
+        handle — otherwise the daemon would look for a host path that does not
+        exist. This is what makes `./docker/data-monitor:/root/.local/solidus`
+        work unchanged: the agent lives on /persist, so its relative binds already
+        point there.
+        """
+        if not path.startswith("/"):
+            return None
+        for handle, entry in (self.config.get("mounts") or {}).items():
+            root = (entry.get("visible_at") or "").rstrip("/")
+            if not root:
+                continue
+            if path != root and not path.startswith(root + "/"):
+                continue
+            base = handle
+            sub = (entry.get("sub") or "").strip("/")
+            if sub:
+                base = f"{handle}/{sub}"
+            if path == root:
+                return base
+            return base + path[len(root):]
+        return None
 
     def map_host_path(self, p):
         for src_prefix, dst_prefix in self.path_maps:
@@ -1386,6 +1584,23 @@ class DockerEngineState:
             if not raw_src.startswith("/"):
                 vobj = self.ensure_volume(raw_src, service=service_name)
                 src = vobj["Mountpoint"]
+                # A config-declared export is published as a volume whose
+                # Mountpoint IS its nfs:// handle. Binding the mountpoint would
+                # hand the guest a host path that does not exist; the handle must
+                # travel through the daemon's NFS path instead, exactly as a
+                # direct `-v nfs://persist:/persist` does. That is what lets a
+                # PROJECT compose file name the volume and receive only the
+                # subdirectory it asked for.
+                if is_nfs_source(src):
+                    mounts_json.append({
+                        "Type": "bind",
+                        "Source": src,
+                        "Destination": dst,
+                        "Mode": "ro" if ro_flag else "rw",
+                        "RW": not ro_flag,
+                    })
+                    binds.append(f"{src}:{dst}{mode}")
+                    continue
                 mounts_json.append({
                     "Type": "volume",
                     "Name": raw_src,
@@ -1396,6 +1611,21 @@ class DockerEngineState:
                     "RW": not ro_flag,
                 })
             else:
+                # A bind from under a declared export is a subtree of that export
+                # (`/persist/...`), not a host path: the agent lives on the
+                # export, so its relative binds resolve there. Translating first
+                # is what makes a project compose file work unchanged.
+                as_export = self.export_for_guest_path(raw_src)
+                if as_export:
+                    mounts_json.append({
+                        "Type": "bind",
+                        "Source": as_export,
+                        "Destination": dst,
+                        "Mode": "ro" if ro_flag else "rw",
+                        "RW": not ro_flag,
+                    })
+                    binds.append(f"{as_export}:{dst}{mode}")
+                    continue
                 src = self.prepare_bind_source(self.map_host_path(raw_src))
                 mounts_json.append({
                     "Type": "bind",
@@ -1428,6 +1658,19 @@ class DockerEngineState:
                 vname = src or secrets.token_hex(8)
                 vobj = self.ensure_volume(vname, service=service_name)
                 src = vobj["Mountpoint"]
+                # Same rule as the short form: a declared export is a volume
+                # whose mountpoint is its nfs:// handle, and the handle has to go
+                # through the daemon's NFS path, never be treated as a host path.
+                if is_nfs_source(src):
+                    mounts_json.append({
+                        "Type": "bind",
+                        "Source": src,
+                        "Destination": dst,
+                        "Mode": "ro" if ro_flag else "rw",
+                        "RW": not ro_flag,
+                    })
+                    binds.append(f"{src}:{dst}{ro}")
+                    continue
                 mounts_json.append({
                     "Type": "volume",
                     "Name": vname,
@@ -2137,8 +2380,7 @@ class DockerHandler(BaseHTTPRequestHandler):
         m = re.match(r"^/volumes/([^/]+)$", path)
         if m:
             vname = urllib.parse.unquote(m.group(1))
-            with eng.lock:
-                v = eng.volumes.get(vname)
+            v = eng.resolve_volume(vname)
             if not v:
                 self.send_json(404, {"message": f"no such volume: {vname}"})
             else:
