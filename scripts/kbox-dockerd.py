@@ -1322,15 +1322,11 @@ class DockerEngineState:
         for handle, entry in (self.config.get("mounts") or {}).items():
             if not handle or not entry.get("source"):
                 continue
-            # The published NAME is the handle's short form ("nfs://persist" ->
-            # "persist"): a volume name cannot contain a slash, so the handle
-            # itself is not a legal name. The handle lives in Mountpoint, and
-            # anything binding this volume goes through the NFS path because of
-            # it.
-            name = handle[len("nfs://"):] if handle.startswith("nfs://") else handle
-            name = name.strip("/").replace("/", "-")
-            if not name:
-                continue
+            # Published under the FULL handle, because that is the name compose
+            # asks for: it resolves a volumes-block alias to `name:` and then
+            # matches that string against this list. A short alias in the list
+            # looks like a missing external volume and the project never starts.
+            name = handle
             with self.lock:
                 existing = self.volumes.get(name)
                 vobj = dict(existing or {})

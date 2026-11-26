@@ -934,6 +934,14 @@ class TestNfsPlacement(unittest.TestCase):
             self.assertEqual(v["Mountpoint"], name)
         self.assertIsNone(self.engine.resolve_volume("nfs://nowhere"))
 
+    def test_declared_exports_are_listed_under_their_full_handle(self):
+        # compose matches a volumes-block `name:` against GET /volumes, so a
+        # declared export listed under a short alias reads as a missing external
+        # volume and the whole project refuses to start.
+        listed = set(self.engine.volumes)
+        self.assertIn("nfs://persist", listed)
+        self.assertIn("nfs://common", listed)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
