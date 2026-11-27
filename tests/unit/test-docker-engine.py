@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -973,6 +974,15 @@ class TestNfsPlacement(unittest.TestCase):
             ) as r:
                 self.assertEqual(r.status, 200)
                 self.assertEqual(json.loads(r.read().decode())["Driver"], "kbox-nfs")
+
+            # Removing it is refused, not silently reported as already gone: the
+            # data is on the server and the config still declares the export.
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1.47/volumes/{name}", method="DELETE"
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 409)
         finally:
             srv.shutdown()
             srv.server_close()

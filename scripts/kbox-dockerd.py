@@ -2820,9 +2820,17 @@ class DockerHandler(BaseHTTPRequestHandler):
             self.send_empty(204)
             return
 
-        m = re.match(r"^/volumes/([^/]+)$", path)
+        m = re.match(r"^/volumes/(.+)$", path)
         if m:
             vname = urllib.parse.unquote(m.group(1))
+            # A declared or derived export is not the engine's to destroy: its
+            # data lives on the server and the config still names it. Refusing is
+            # the honest answer; 404 would read as "already gone".
+            if eng.resolve_volume(vname) and is_nfs_source(vname):
+                self.send_json(409, {"message":
+                                     f"volume {vname} is a declared export and "
+                                     f"cannot be removed"})
+                return
             try:
                 removed = eng.remove_volume(vname)
             except ValueError as e:
