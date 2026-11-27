@@ -2379,7 +2379,11 @@ class DockerHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"Volumes": vols, "Warnings": []})
             return
 
-        m = re.match(r"^/volumes/([^/]+)$", path)
+        # The name is percent-decoded, and an nfs:// handle contains slashes of
+        # its own, so the capture must allow them: `[^/]+` matched `nfs:` only
+        # and every lookup of a declared export 404'd — which compose reads as a
+        # missing external volume.
+        m = re.match(r"^/volumes/(.+)$", path)
         if m:
             vname = urllib.parse.unquote(m.group(1))
             v = eng.resolve_volume(vname)

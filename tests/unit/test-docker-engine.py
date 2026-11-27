@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 import urllib.request
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -951,6 +952,30 @@ class TestNfsPlacement(unittest.TestCase):
         self.assertIn("nfs://persist/persists/pod-0", listed)
         # The bare handle is still published, for a container that wants it all.
         self.assertIn("nfs://persist", listed)
+
+    def test_volume_inspect_route_accepts_a_slashed_name(self):
+        # compose checks an external volume with GET /volumes/<name>, and the
+        # name comes percent-encoded with slashes inside it. A route that stopped
+        # at the first slash matched "nfs:" and 404'd, which compose reports as
+        # a missing external volume.
+        srv = kbox_dockerd.ThreadingHTTPServer(
+            ("127.0.0.1", 0), kbox_dockerd.DockerHandler
+        )
+        srv.engine = self.engine
+        srv.verbose = False
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            name = urllib.parse.quote("nfs://persist", safe="")
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/v1.47/volumes/{name}"
+            ) as r:
+                self.assertEqual(r.status, 200)
+                self.assertEqual(json.loads(r.read().decode())["Driver"], "kbox-nfs")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":
