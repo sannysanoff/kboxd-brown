@@ -31,6 +31,7 @@
 #include "daemon.h"
 #include "fd-table.h"
 #include "kbox/daemon-json.h"
+#include "kbox/daemon-resolv.h"
 #include "kbox/elf.h"
 #include "kbox/mount.h"
 #include "lkl-wrap.h"
@@ -1932,9 +1933,18 @@ static void *container_worker_thread(void *arg)
                 fclose(hf);
             }
         }
-        if (rlen == 0)
-            rlen =
-                (size_t) snprintf(res, sizeof(res), "nameserver %s\n", gw_ip);
+        if (rlen == 0) {
+            char pod_resolv[1024] = {0};
+            FILE *hf = fopen("/etc/resolv.conf", "re");
+            if (hf) {
+                size_t got = fread(pod_resolv, 1, sizeof(pod_resolv) - 1, hf);
+                pod_resolv[got] = '\0';
+                fclose(hf);
+            }
+            /* The pod's search domains are what resolve a short cluster service
+             * name; see kbox_render_resolv. */
+            rlen = kbox_render_resolv(res, sizeof(res), gw_ip, pod_resolv);
+        }
         kbox_lkl_write(sysnrs, rfd, res, (long) rlen);
         kbox_lkl_close(sysnrs, rfd);
     }

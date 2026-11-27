@@ -15,7 +15,8 @@ TEST_SRCS  = $(TEST_DIR)/test-runner.c \
              $(TEST_DIR)/test-locks.c \
              $(TEST_DIR)/test-bind-path.c \
              $(TEST_DIR)/test-x86-decode.c \
-             $(TEST_DIR)/test-daemon-json.c
+             $(TEST_DIR)/test-daemon-json.c \
+             $(TEST_DIR)/test-daemon-resolv.c
 
 # Linux-only tests (depend on inline asm, siginfo_t/ucontext, memfd_create):
 ifeq ($(shell uname -s),Linux)
@@ -45,7 +46,8 @@ TEST_SUPPORT_SRCS = $(SRC_DIR)/fd-table.c \
                     $(SRC_DIR)/syscall-nr.c \
                     $(SRC_DIR)/elf.c \
                     $(SRC_DIR)/x86-decode.c \
-                    $(SRC_DIR)/jsonreq.c
+                    $(SRC_DIR)/jsonreq.c \
+                    $(SRC_DIR)/resolv.c
 
 ifeq ($(shell uname -s),Linux)
 TEST_SUPPORT_SRCS += $(SRC_DIR)/rewrite.c \
