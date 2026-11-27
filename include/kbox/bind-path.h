@@ -15,6 +15,8 @@
 
 #include "path.h"
 
+#define KBOX_NFS_REF_PREFIX "nfs://"
+
 struct kbox_host_bind {
     char host_path[KBOX_MAX_PATH];
     char guest_path[KBOX_MAX_PATH];
@@ -41,6 +43,21 @@ int kbox_bind_guest_to_host(const struct kbox_host_bind *binds,
                             const char *guest,
                             char *out,
                             size_t out_size);
+
+/* Resolve a path that lies inside a bind the daemon mounts itself.
+ *
+ * Those binds keep an "nfs://<name>[/subdir]" reference in host_path, and the
+ * daemon mounts it at KBOX_NFS_ROOT/<name>/<subdir>. A container path inside
+ * such a bind has no usable counterpart under the container root: only a
+ * placeholder exists there, and a subdirectory of it does not exist at all, so
+ * a bind of that subdirectory fails with ENOENT. Returns 1 when the path was
+ * resolved, 0 when it lies outside every such bind, -ENAMETOOLONG otherwise.
+ */
+int kbox_bind_nfs_source(const struct kbox_host_bind *binds,
+                         size_t count,
+                         const char *guest,
+                         char *out,
+                         size_t out_size);
 
 /* Translate an absolute host path back to the guest path of its bind.
  * Same return convention as kbox_bind_guest_to_host(). */

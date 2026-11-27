@@ -115,6 +115,7 @@ union kbox_semun {
 #endif
 #endif
 
+#include "daemon.h"
 #include "dispatch-internal.h"
 #include "fd-table.h"
 #include "kbox/elf.h"
@@ -9462,12 +9463,17 @@ static struct kbox_dispatch forward_mount(
     char translated_src[KBOX_MAX_PATH];
     const char *effective_src = source;
     if (source && (flags & 0x1000 /* MS_BIND */)) {
-        rc =
-            kbox_translate_path_for_lkl(pid, srcbuf, ctx->host_root,
-                                        translated_src, sizeof(translated_src));
-        if (rc < 0)
-            return kbox_dispatch_errno(-rc);
-        effective_src = translated_src;
+        if (kbox_bind_nfs_source(ctx->host_binds, ctx->host_bind_count, srcbuf,
+                                 translated_src, sizeof(translated_src)) > 0) {
+            effective_src = translated_src;
+        } else {
+            rc = kbox_translate_path_for_lkl(pid, srcbuf, ctx->host_root,
+                                             translated_src,
+                                             sizeof(translated_src));
+            if (rc < 0)
+                return kbox_dispatch_errno(-rc);
+            effective_src = translated_src;
+        }
     }
 
     long ret = kbox_lkl_mount(ctx->sysnrs, effective_src, translated_tgt,

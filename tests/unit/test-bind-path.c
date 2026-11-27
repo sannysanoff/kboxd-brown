@@ -126,6 +126,77 @@ static void test_no_binds_or_relative_paths_translate_nothing(void)
               0);
 }
 
+/* A bind source that sits inside a volume the daemon mounts itself has no
+ * useful name under the container root: only a placeholder lives there, and a
+ * subdirectory of it does not exist at all. The volume reference in host_path
+ * names where the kernel actually mounted it. */
+static void test_nfs_bind_resolves_to_the_mounted_path(void)
+{
+    struct kbox_host_bind b;
+    char out[KBOX_MAX_PATH];
+
+    make_bind(&b, "/x", "nfs://persist/persists/seat/docker/volumes/probe");
+    b.is_nfs = 1;
+    ASSERT_EQ(kbox_bind_nfs_source(&b, 1, "/x/sub", out, sizeof(out)), 1);
+    ASSERT_EQ(strcmp(out,
+                     "/kbox-vol/nfs/persist/persists/seat/docker/volumes/"
+                     "probe/sub"),
+              0);
+    /* The volume root itself keeps no trailing separator. */
+    ASSERT_EQ(kbox_bind_nfs_source(&b, 1, "/x", out, sizeof(out)), 1);
+    ASSERT_EQ(strcmp(out,
+                     "/kbox-vol/nfs/persist/persists/seat/docker/volumes/"
+                     "probe"),
+              0);
+}
+
+static void test_nfs_bind_ignores_other_paths(void)
+{
+    struct kbox_host_bind b;
+    char out[KBOX_MAX_PATH];
+
+    make_bind(&b, "/vol", "nfs://persist/vol");
+    b.is_nfs = 1;
+    /* A different component that merely starts the same way is not inside. */
+    ASSERT_EQ(kbox_bind_nfs_source(&b, 1, "/volume/x", out, sizeof(out)), 0);
+    ASSERT_EQ(kbox_bind_nfs_source(&b, 1, "/other", out, sizeof(out)), 0);
+    ASSERT_EQ(kbox_bind_nfs_source(&b, 1, "relative", out, sizeof(out)), 0);
+    ASSERT_EQ(kbox_bind_nfs_source(NULL, 0, "/vol/x", out, sizeof(out)), 0);
+}
+
+static void test_nfs_bind_skips_plain_host_binds(void)
+{
+    struct kbox_host_bind b;
+    char out[KBOX_MAX_PATH];
+
+    make_bind(&b, "/vol", "/data/vol");
+    ASSERT_EQ(kbox_bind_nfs_source(&b, 1, "/vol/x", out, sizeof(out)), 0);
+}
+
+static void test_nfs_bind_longest_prefix_wins(void)
+{
+    struct kbox_host_bind b[2];
+    char out[KBOX_MAX_PATH];
+
+    make_bind(&b[0], "/vol", "nfs://persist/outer");
+    b[0].is_nfs = 1;
+    make_bind(&b[1], "/vol/inner", "nfs://other/inner");
+    b[1].is_nfs = 1;
+    ASSERT_EQ(kbox_bind_nfs_source(b, 2, "/vol/inner/f", out, sizeof(out)), 1);
+    ASSERT_EQ(strcmp(out, "/kbox-vol/nfs/other/inner/f"), 0);
+}
+
+static void test_nfs_bind_reports_a_short_buffer(void)
+{
+    struct kbox_host_bind b;
+    char out[8];
+
+    make_bind(&b, "/vol", "nfs://persist/deep/path");
+    b.is_nfs = 1;
+    ASSERT_EQ(kbox_bind_nfs_source(&b, 1, "/vol/x", out, sizeof(out)),
+              -ENAMETOOLONG);
+}
+
 void test_bind_path_init(void)
 {
     TEST_REGISTER(test_guest_path_maps_to_the_host_directory);
@@ -136,4 +207,9 @@ void test_bind_path_init(void)
     TEST_REGISTER(test_a_daemon_mounted_bind_is_left_alone);
     TEST_REGISTER(test_a_short_buffer_is_reported);
     TEST_REGISTER(test_no_binds_or_relative_paths_translate_nothing);
+    TEST_REGISTER(test_nfs_bind_resolves_to_the_mounted_path);
+    TEST_REGISTER(test_nfs_bind_ignores_other_paths);
+    TEST_REGISTER(test_nfs_bind_skips_plain_host_binds);
+    TEST_REGISTER(test_nfs_bind_longest_prefix_wins);
+    TEST_REGISTER(test_nfs_bind_reports_a_short_buffer);
 }
