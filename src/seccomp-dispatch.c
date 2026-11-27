@@ -7177,8 +7177,15 @@ static struct kbox_dispatch forward_fcntl(
             return kbox_dispatch_errno((int) (-ret));
 
         int mirror = kbox_fd_table_mirror_tty(ctx->fd_table, fd);
-        long new_vfd =
-            kbox_fd_table_insert_from(ctx->fd_table, arg, ret, mirror);
+        /* F_DUPFD asks for the lowest number at or above `arg`, and POSIX lets
+         * the kernel pick anything above it -- open() already answers 32768 and
+         * up. Allocate in that same virtual band: a duplicated LKL file parked
+         * below KBOX_FD_BASE is closed by the host kernel (the filter lets
+         * those closes through), which answers EBADF and strands the table
+         * entry. glibc's dup() on aarch64 is exactly this call. */
+        long new_vfd = kbox_fd_table_insert_from(
+            ctx->fd_table, arg < KBOX_FD_BASE ? KBOX_FD_BASE : arg, ret,
+            mirror);
         if (new_vfd < 0 ||
             (ctx->active_proc &&
              (uint64_t) new_vfd >= ctx->active_proc->rlimit_nofile_cur)) {
@@ -7640,7 +7647,11 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
         return kbox_dispatch_errno((int) (-ret));
 
     int mirror = kbox_fd_table_mirror_tty(ctx->fd_table, fd);
-    long new_vfd = kbox_fd_table_insert_lowest(ctx->fd_table, ret, mirror);
+    /* Allocate in the virtual band, like openat does, NOT at the lowest free
+     * number: the filter lets a close() below KBOX_FD_BASE run in the host
+     * kernel, so a duplicated LKL file parked at fd 3 answers EBADF and leaves
+     * its table entry behind. */
+    long new_vfd = kbox_fd_table_insert(ctx->fd_table, ret, mirror);
     if (new_vfd < 0 ||
         (ctx->active_proc &&
          (uint64_t) new_vfd >= ctx->active_proc->rlimit_nofile_cur)) {
