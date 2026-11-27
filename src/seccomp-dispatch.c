@@ -8884,6 +8884,11 @@ static struct kbox_dispatch forward_unlinkat(
 
 /* forward_renameat / forward_renameat2. */
 
+/* renameat2 flags, spelled out because the header that defines them is not
+ * part of the tree everywhere this file is built. */
+#define KBOX_RENAME_NOREPLACE_FLAG 0x1
+#define KBOX_RENAME_EXCHANGE_FLAG 0x2
+
 static struct kbox_dispatch do_renameat(const struct kbox_syscall_request *req,
                                         struct kbox_supervisor_ctx *ctx,
                                         long flags)
@@ -8950,6 +8955,51 @@ static struct kbox_dispatch do_renameat(const struct kbox_syscall_request *req,
 
     long ret = kbox_lkl_renameat2(ctx->sysnrs, olddirfd, oldtrans, newdirfd,
                                   newtrans, flags);
+
+    /* The NFS client in LKL exports .rename but not .rename2, so the kernel
+     * rejects RENAME_NOREPLACE and RENAME_EXCHANGE with EINVAL before any
+     * request goes out. BuildKit issues RENAME_NOREPLACE for every atomic
+     * write, and with no fallback the build dies at the first one. Emulate
+     * the two flags here, at the only layer that knows they were asked for:
+     * RENAME_NOREPLACE becomes an existence test followed by a plain rename,
+     * and RENAME_EXCHANGE a three-step rotation through a temporary name. */
+    if (ret == -EINVAL && flags != 0) {
+        if (flags & KBOX_RENAME_NOREPLACE_FLAG) {
+            struct stat st;
+
+            if (kbox_lkl_newfstatat(ctx->sysnrs, newdirfd, newtrans, &st, 0) ==
+                0) {
+                return kbox_dispatch_errno(EEXIST);
+            }
+            ret = kbox_lkl_renameat2(ctx->sysnrs, olddirfd, oldtrans, newdirfd,
+                                     newtrans, 0);
+        } else if (flags & KBOX_RENAME_EXCHANGE_FLAG) {
+            char tmp[KBOX_MAX_PATH];
+            int n = snprintf(tmp, sizeof(tmp), "%s.kboxxchg", newtrans);
+
+            if (n > 0 && (size_t) n < sizeof(tmp)) {
+                long r1 = kbox_lkl_renameat2(ctx->sysnrs, newdirfd, newtrans,
+                                             newdirfd, tmp, 0);
+
+                if (r1 >= 0) {
+                    long r2 = kbox_lkl_renameat2(
+                        ctx->sysnrs, olddirfd, oldtrans, newdirfd, newtrans, 0);
+
+                    if (r2 < 0) {
+                        (void) kbox_lkl_renameat2(ctx->sysnrs, newdirfd, tmp,
+                                                  newdirfd, newtrans, 0);
+                        ret = r2;
+                    } else {
+                        ret = kbox_lkl_renameat2(ctx->sysnrs, newdirfd, tmp,
+                                                 olddirfd, oldtrans, 0);
+                    }
+                } else {
+                    ret = r1;
+                }
+            }
+        }
+    }
+
     if (ret >= 0)
         invalidate_path_shadow_cache(ctx);
     else if (getenv("KBOX_TRACE"))
