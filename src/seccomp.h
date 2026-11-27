@@ -240,12 +240,36 @@ struct kbox_pending_connect_poll {
 
 #define KBOX_PENDING_CONNECT_POLLS_MAX 16
 
+/* One open file description as the guest sees it.
+ *
+ * The guest's descriptor is a memfd on the host, so the kernel tells us when
+ * the last reference goes away: an IN_CLOSE event on that inode. The LKL side
+ * and the shadow belong to this record rather than to any single descriptor
+ * slot, because dup() shares them and only the final close releases them.
+ */
+struct kbox_vfd_watch {
+    int wd;
+    long lkl_fd;
+    int shadow_sp;
+    int shadow_writeback;
+    long shadow_mtime_sec;
+    long shadow_mtime_nsec;
+    long shadow_size;
+    uint64_t guest_id;
+    int in_use;
+};
+
 struct kbox_supervisor_ctx {
     const struct kbox_sysnrs *sysnrs;
     const struct kbox_host_nrs *host_nrs;
     struct kbox_fd_table *fd_table;
     int listener_fd;
     int proc_self_fd_dirfd;
+    /* Closes run in the host kernel; this is how their effect is learned. */
+    int close_inotify_fd;
+    struct kbox_vfd_watch *close_watches;
+    size_t close_watch_count;
+    size_t close_watch_cap;
     int proc_mem_fd;
     int inherited_fds_tracked;
     pid_t child_pid;

@@ -11,77 +11,33 @@ struct kbox_sysnrs; /* forward declaration */
 
 /* Virtual FD table.
  *
- * Maps guest-visible FDs (starting at KBOX_FD_BASE) to LKL-internal FDs. Flat
- * array indexed by (vfd - KBOX_FD_BASE). O(1) lookup, zero allocator overhead,
- * cache-friendly.
+ * Maps guest descriptors to LKL-internal or host-managed descriptors. Flat
+ * array indexed by the descriptor number itself. O(1) lookup, zero allocator
+ * overhead, cache-friendly.
  */
 
-#define KBOX_FD_BASE 32768
-/* Guest descriptor space: 3072 descriptors a guest process can hold open at
- * once (the general band plus the writable-shadow band; the last quarter is
- * reserved for host-passthrough descriptors whose syscalls the BPF filter lets
- * through without a supervisor round trip).
- *
- * Growing this table is not a one-line change: sizes above 4096 expose a
- * descriptor-accounting leak under sustained open/close load (a 16384-entry
- * table loses the whole general band after one 12288-descriptor batch, with
- * /proc/self/fd empty in the guest and no entry ever removed twice). The
- * suites this table serves need a few hundred descriptors, so the proven size
- * is kept until that accounting bug is understood.
+/* Guest descriptor ceiling: one flat slot per possible descriptor number, so
+ * a descriptor keeps its number from the moment it is minted. 65536 is the
+ * ceiling a guest may raise RLIMIT_NOFILE to.
  */
-#define KBOX_FD_TABLE_MAX 4096
-#define KBOX_FD_FAST_BASE (KBOX_FD_BASE + (KBOX_FD_TABLE_MAX / 2))
-#define KBOX_FD_HOSTONLY_BASE (KBOX_FD_BASE + ((KBOX_FD_TABLE_MAX * 3) / 4))
+#define KBOX_FD_TABLE_MAX 65536
 
-/* Host-passthrough descriptors that kbox injects itself -- pipes today -- are
- * installed in this band of low numbers, and the seccomp filter lets the kernel
- * close them without asking the supervisor.
+/* One slot per descriptor number; nothing is reserved by position. */
+#define KBOX_FD_TABLE_CAPACITY KBOX_FD_TABLE_MAX
+
+/* Native close boundary [0, KBOX_NATIVE_CLOSE_MAX).
  *
- * A close that goes through a notification can be lost: while the tracee waits
- * for the answer another task of its process group may deliver a signal, the
- * kernel then abandons the notification and the supervisor's answer fails with
- * ENOENT ("answer lost"). The close never runs, and the descriptor stays open.
- * A shell hits this on every command substitution whose child exits while the
- * parent closes the pipe, leaks the descriptor, and a pipeline reader waits for
- * an end-of-file that never comes. Measured: 20 -> 76 descriptors over 120
- * command substitutions while plain Docker stayed at 4, and jemalloc's
- * config.status hung on it.
- *
- * The band is below KBOX_LOW_FD_MAX so a program that selects on these
- * descriptors keeps them inside FD_SETSIZE. Nothing kbox must observe on close
- * lives here: the entries are plain host descriptors whose close is the
- * kernel's own business, and the table slot is rewritten when the number is
- * reused.
+ * Host-kernel descriptors created natively (pipes, pipe2, stdio, host sockets)
+ * take the lowest free numbers below this boundary, and the seccomp filter
+ * allows close(fd) for fd < KBOX_NATIVE_CLOSE_MAX directly in the host kernel.
+ * That avoids the seccomp_unotify pre-NOTIF_RECV signal race (SIGCHLD aborting
+ * close() with ERESTARTSYS/EINTR before the supervisor receives it, leaking
+ * pipe descriptors in shells). Virtual LKL descriptors auto-allocate from
+ * KBOX_NATIVE_CLOSE_MAX upward so their close() always reaches the supervisor;
+ * any virtual descriptor explicitly placed below it (via dup2/dup3/F_DUPFD)
+ * receives a real host placeholder fd so native close() succeeds with 0.
  */
-#define KBOX_FD_PIPE_BASE 512
-#define KBOX_FD_PIPE_TOP KBOX_LOW_FD_MAX /* exclusive */
-
-/* The lowest RLIMIT_NOFILE a guest may set.
- *
- * A guest descriptor is a real descriptor in the tracee, numbered at
- * KBOX_FD_BASE or above: the forwarded mmap names it, and the kernel refuses
- * SECCOMP_IOCTL_NOTIF_ADDFD for a target at or above RLIMIT_NOFILE with EBADF.
- * A guest that lowers the limit to exercise descriptor exhaustion therefore
- * loses the ability to map any file. MariaDB's test runner does this, and every
- * library failed with ENODEV until the requested limit was raised back here.
- */
-#define KBOX_GUEST_NOFILE_FLOOR (KBOX_FD_BASE + KBOX_FD_TABLE_MAX)
-
-static inline void kbox_fd_floor_nofile_limit(uint64_t *cur, uint64_t *max)
-{
-    /* RLIM_INFINITY is UINT64_MAX and needs no change. */
-    if (*max != UINT64_MAX && *max < KBOX_GUEST_NOFILE_FLOOR)
-        *max = KBOX_GUEST_NOFILE_FLOOR;
-    if (*cur < KBOX_GUEST_NOFILE_FLOOR)
-        *cur = KBOX_GUEST_NOFILE_FLOOR;
-}
-
-/* redirect slots for FDs 0..1023 (dup2 targets) */
-#define KBOX_LOW_FD_MAX 1024
-/* tracked host-passthrough FDs in the gap [1024, 32768) */
-#define KBOX_MID_FD_MAX (KBOX_FD_BASE - KBOX_LOW_FD_MAX)
-#define KBOX_FD_TABLE_CAPACITY \
-    (KBOX_FD_TABLE_MAX + KBOX_LOW_FD_MAX + KBOX_MID_FD_MAX)
+#define KBOX_NATIVE_CLOSE_MAX 1024
 
 /* Reverse lookup for host_fd -> virtual fd. Sized to cover the
  * child's RLIMIT_NOFILE (65536). Host FDs at or above this bound
@@ -126,6 +82,7 @@ struct kbox_fd_entry {
      * read.
      */
     uint64_t guest_id;
+    int watch_wd;   /* inotify watch on this descriptor's memfd, -1 if none */
     int host_sv_fd; /* supervisor-side FD sharing host-passthrough struct file
                      */
     int shadow_sp;  /* supervisor's dup of shadow socket sp[1], -1 if none.
@@ -184,14 +141,12 @@ struct kbox_fd_table {
      */
     uint16_t lkl_fd_refs[KBOX_LKL_FD_REFMAX];
     /* Bitmap of high slots currently mapped to a low host_fd
-     * (< KBOX_FD_BASE), letting the supervisor sweep natively closed bridged
+     * (host_fd != vfd), letting the supervisor sweep natively closed bridged
      * sockets in O(number of bridged sockets) instead of scanning all 4096
      * slots. */
     uint64_t low_host_bitmap[KBOX_FD_TABLE_MAX / 64];
     unsigned low_host_count;
-    long next_fd;          /* Next virtual FD to allocate */
-    long next_fast_fd;     /* Next host-shadow fast FD to allocate */
-    long next_hostonly_fd; /* Next host-only cached-shadow FD to allocate */
+    long next_fd; /* Next virtual FD to allocate */
 };
 
 static inline bool kbox_fd_entry_is_active(const struct kbox_fd_entry *e)

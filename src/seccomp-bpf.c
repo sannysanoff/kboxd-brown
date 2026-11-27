@@ -361,20 +361,30 @@ static int install_seccomp_filter(const struct kbox_host_nrs *h,
     EMIT_ALLOW(h->rt_sigreturn);
 #undef EMIT_ALLOW
 
-    /* Every fd-based call is notified. The supervisor decides from its own
-     * table whether the descriptor is a virtual (LKL) one or a plain host one,
-     * so the filter never has to infer the owner from the number's range. */
+    /* close(fd) runs in the host kernel for every number.
+     *
+     * A notification for close is committed before the syscall can return, and
+     * the kernel abandons it when a signal reaches the tracee before the
+     * supervisor receives it. A command-substitution child exits while its
+     * parent closes the pipe, so SIGCHLD lands in exactly that window: the
+     * guest gets EINTR for close, which POSIX does not retry, and the pipe end
+     * leaks. Running the close in the kernel removes the window; the
+     * supervisor learns of it from an inotify watch on the descriptor's memfd.
+     */
+    if (h->close >= 0) {
+        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
+            KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, (unsigned int) h->close,
+            0, 1);
+        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
+            KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
+    }
 
     /* pipe() and pipe2() run in the kernel.
      *
      * A notified pipe() is committed to a notification before it can return,
      * and the kernel abandons that notification when a signal reaches the
      * tracee before the supervisor receives it. The guest then gets EINTR for
-     * a syscall that a real kernel never fails: about once in 36 command
-     * substitutions on a build, which is what made configure drop a line and
-     * jemalloc generate a truncated header (item 33). Letting the kernel
-     * create the pair removes the notification entirely; the descriptors are
-     * closed in the kernel too, by the rule above.
+     * a syscall that a real kernel never fails.
      */
     {
         if (h->pipe >= 0) {

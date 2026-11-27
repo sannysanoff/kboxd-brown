@@ -1524,7 +1524,7 @@ static struct kbox_dispatch exec_via_virtual_fd(
 
     /* The tracee already holds a host descriptor here: the kernel can exec it
      * without help (this is the re-exec through the image.c exec memfd). */
-    if (!force && fd >= KBOX_FD_BASE && child_fd_is_open(ctx, fd))
+    if (!force && child_fd_is_open(ctx, fd))
         return kbox_dispatch_continue();
 
     /* Build the image from the bytes the guest wrote. A writable open keeps

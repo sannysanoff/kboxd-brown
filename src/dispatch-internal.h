@@ -83,7 +83,7 @@ static inline int fd_should_deny_io_ctx(struct kbox_fd_table *t,
         return 0;
     if (t && kbox_fd_table_find_by_host_fd(t, fd) >= 0)
         return 0;
-    if (t && fd >= 0 && fd < KBOX_FD_BASE &&
+    if (t && fd >= 0 && kbox_fd_table_get_lkl(t, fd) == -1 &&
         kbox_fd_adopt_host_object(t, kbox_cur_tracee_pid, fd))
         return 0;
     return 1;
@@ -339,10 +339,9 @@ int request_addfd_at(const struct kbox_supervisor_ctx *ctx,
                      int srcfd,
                      int target_fd,
                      uint32_t newfd_flags);
-/* Install srcfd at the lowest free number in the host-passthrough band
- * [KBOX_FD_PIPE_BASE, KBOX_FD_PIPE_TOP) so the kernel can close it itself, and
- * fall back to the lowest free number when the band is full or the kernel does
- * not support ADDFD at a chosen descriptor. */
+/* Install srcfd at the lowest free number, same as request_addfd: no fd call
+ * needs a reserved band now that every descriptor's ownership is decided from
+ * the table. */
 int request_addfd_passthrough(const struct kbox_supervisor_ctx *ctx,
                               const struct kbox_syscall_request *req,
                               int srcfd,
@@ -400,8 +399,6 @@ void translate_proc_self(const char *path,
 /* FD utilities. */
 
 int child_fd_is_open(const struct kbox_supervisor_ctx *ctx, long fd);
-long allocate_passthrough_hostonly_fd(struct kbox_supervisor_ctx *ctx);
-long next_hostonly_fd_hint(const struct kbox_supervisor_ctx *ctx);
 int ensure_proc_self_fd_dir(struct kbox_supervisor_ctx *ctx);
 int ensure_proc_mem_fd(struct kbox_supervisor_ctx *ctx);
 
@@ -715,5 +712,8 @@ struct kbox_dispatch forward_epoll_create1(
 #define CLONE_NEW_MASK                                              \
     (CLONE_NEWNS | CLONE_NEWTIME | CLONE_NEWCGROUP | CLONE_NEWUTS | \
      CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET)
+
+/* Releases the descriptors whose last guest reference the kernel reports. */
+void kbox_drain_close_watches(struct kbox_supervisor_ctx *ctx);
 
 #endif /* KBOX_DISPATCH_INTERNAL_H */

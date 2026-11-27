@@ -22,7 +22,8 @@ TEST_SRCS  = $(TEST_DIR)/test-runner.c \
 # Linux-only tests (depend on inline asm, siginfo_t/ucontext, memfd_create):
 ifeq ($(shell uname -s),Linux)
 TEST_SRCS += $(TEST_DIR)/test-procmem.c \
-             $(TEST_DIR)/test-syscall-request.c
+             $(TEST_DIR)/test-syscall-request.c \
+             $(TEST_DIR)/test-inotify-close.c
 endif
 
 # Unit tests link only the pure-computation sources (no LKL)

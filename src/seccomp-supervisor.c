@@ -437,8 +437,6 @@ static int supervise_loop(struct kbox_supervisor_ctx *ctx)
                     ifd = strtol(de->d_name, &endp, 10);
                     if (errno || *endp != '\0' || ifd < 0)
                         continue;
-                    if (ifd >= KBOX_FD_BASE)
-                        continue;
                     if (kbox_fd_table_get_lkl(ctx->fd_table, ifd) != -1)
                         continue;
                     kbox_fd_table_insert_at(ctx->fd_table, ifd,
@@ -755,8 +753,8 @@ int kbox_run_supervisor_volumes(const struct kbox_sysnrs *sysnrs,
     int listener_fd;
     int exit_code;
     int status;
-    /* The FD table holds KBOX_FD_TABLE_MAX + KBOX_MID_FD_MAX + KBOX_LOW_FD_MAX
-     * entries (4.5 MiB) and the context adds 0.4 MiB. As locals they overflowed
+    /* The FD table holds KBOX_FD_TABLE_MAX entries (8.9 MiB) and the
+     * context adds 0.4 MiB. As locals they overflowed
      * the 8 MiB stack at -O2, where the caller's frame is still on the stack,
      * and the supervisor died with SIGSEGV before its first statement. They
      * live for the whole process, so they belong on the heap. */
@@ -921,6 +919,7 @@ int kbox_run_supervisor_volumes(const struct kbox_sysnrs *sysnrs,
     ctx->fd_table = fd_table;
     ctx->listener_fd = listener_fd;
     ctx->proc_self_fd_dirfd = -1;
+    ctx->close_inotify_fd = -1;
     ctx->proc_mem_fd = -1;
     ctx->child_pid = pid;
     ctx->host_root = host_root;
@@ -951,6 +950,12 @@ int kbox_run_supervisor_volumes(const struct kbox_sysnrs *sysnrs,
         close(ctx->proc_mem_fd);
     if (ctx->proc_self_fd_dirfd >= 0)
         close(ctx->proc_self_fd_dirfd);
+    if (ctx->close_inotify_fd >= 0)
+        close(ctx->close_inotify_fd);
+    free(ctx->close_watches);
+    ctx->close_watches = NULL;
+    ctx->close_watch_count = 0;
+    ctx->close_watch_cap = 0;
     close(listener_fd);
 
     if (exit_code < 0) {

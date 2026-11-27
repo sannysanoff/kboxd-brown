@@ -24,9 +24,9 @@
 #define KBOX_SECCOMP_SET_MODE_FILTER 1
 #define KBOX_SECCOMP_FILTER_FLAG_NEW_LISTENER 8
 /* Wait in a killable state once the supervisor has received the
- * notification (Linux 6.4+). Without it every signal delivered to the
- * tracee aborts the notification and the syscall returns EINTR, which some
- * callers -- a shell's close, musl's pipe -- never retry. */
+ * notification (Linux 5.19+). Note that before NOTIF_RECV (SECCOMP_NOTIFY_INIT)
+ * the wait is still interruptible by non-fatal signals, so syscalls that
+ * callers never retry on EINTR (pipe, low-fd close) must bypass USER_NOTIF. */
 #define KBOX_SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV 32
 
 #define KBOX_SECCOMP_DATA_NR_OFFSET 0
@@ -34,6 +34,7 @@
 #define KBOX_SECCOMP_DATA_IP_LO_OFFSET 8
 #define KBOX_SECCOMP_DATA_IP_HI_OFFSET 12
 #define KBOX_SECCOMP_DATA_ARG0_LO_OFFSET 16
+#define KBOX_SECCOMP_DATA_ARG0_HI_OFFSET 20
 #define KBOX_SECCOMP_DATA_ARG2_LO_OFFSET 32
 #define KBOX_SECCOMP_DATA_ARG4_LO_OFFSET 48
 

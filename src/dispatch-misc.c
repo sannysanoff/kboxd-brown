@@ -981,7 +981,7 @@ done:
         if (cur >= 0)
             (void) kbox_lkl_lseek(ctx->sysnrs, lkl_fd, (long) cur, SEEK_SET);
     }
-    if (getenv("KBOX_FD_TRACE") && fd >= KBOX_FD_BASE)
+    if (getenv("KBOX_FD_TRACE") && fd >= 0)
         fprintf(stderr,
                 "kbofdt: iov done fd=%ld lkl=%ld write=%d total=%zu err=%d\n",
                 fd, lkl_fd, is_write, total, err);

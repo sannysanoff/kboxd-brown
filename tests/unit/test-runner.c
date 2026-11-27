@@ -108,6 +108,7 @@ extern void test_elf_init(void);
 #ifdef __linux__
 extern void test_procmem_init(void);
 extern void test_syscall_request_init(void);
+extern void test_inotify_close_init(void);
 #endif
 
 int main(int argc, char *argv[])
@@ -135,6 +136,7 @@ int main(int argc, char *argv[])
 #ifdef __linux__
     test_procmem_init();
     test_syscall_request_init();
+    test_inotify_close_init();
 #endif
 
     /* Run all tests */

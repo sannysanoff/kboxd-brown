@@ -195,7 +195,7 @@ static int attach_shadow_socket(const struct kbox_syscall_request *req,
     /* A prior bridged socket that held this low host_fd may have been closed
      * natively in the kernel (item 33). Retire it before installing the new
      * reverse mapping so lookup never returns the dead socket (item 37). */
-    if (host_fd < KBOX_FD_BASE)
+    if (host_fd >= 0)
         kbox_retire_stale_host_fd_vfd(ctx, kbox_syscall_request_pid(req),
                                       host_fd, 1);
     kbox_fd_table_set_host_fd(ctx->fd_table, vfd, host_fd);
@@ -215,7 +215,7 @@ static int attach_shadow_socket(const struct kbox_syscall_request *req,
     if (e) {
         e->shadow_sp = sp[1];
         e->sock_type = base_type & 0xf;
-        if (host_fd < KBOX_FD_BASE)
+        if (host_fd >= 0)
             e->guest_id =
                 kbox_guest_fd_identity(kbox_syscall_request_pid(req), host_fd);
         if (sock_flags & SOCK_CLOEXEC)
@@ -251,7 +251,7 @@ struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
         close(hfd);
         if (tfd < 0)
             return kbox_dispatch_errno(-tfd);
-        if (tfd < KBOX_FD_BASE)
+        if (tfd >= 0)
             kbox_retire_stale_host_fd_vfd(ctx, kbox_syscall_request_pid(req),
                                           tfd, 1);
         track_host_passthrough_fd(ctx->fd_table, tfd);
@@ -1569,11 +1569,11 @@ struct kbox_dispatch forward_getsockopt(const struct kbox_syscall_request *req,
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY ||
         (lkl_fd < 0 && !fd_should_deny_io_ctx(ctx->fd_table, fd, lkl_fd))) {
         /* SO_PEERCRED on a host-passthrough socket (every AF_UNIX one is: LKL
-         * has no unix sockets) is answered by the HOST kernel, which reports the
-         * host owner of the peer -- the role user, uid 1000 -- while the guest
-         * believes it is uid 0. A guest-side peer check then sees a stranger:
-         * hermes refuses its own gateway with "unsafe_control_peer" and every
-         * agent run dies before its first model call.
+         * has no unix sockets) is answered by the HOST kernel, which reports
+         * the host owner of the peer -- the role user, uid 1000 -- while the
+         * guest believes it is uid 0. A guest-side peer check then sees a
+         * stranger: hermes refuses its own gateway with "unsafe_control_peer"
+         * and every agent run dies before its first model call.
          *
          * Report the identity the guest would present. The opposite rewrite
          * already exists in sendmsg, which turns SCM_CREDENTIALS into host
@@ -1595,8 +1595,8 @@ struct kbox_dispatch forward_getsockopt(const struct kbox_syscall_request *req,
                     memset(&uc, 0, sizeof(uc));
                     uc.uid = ctx->root_identity ? 0 : (uint32_t) getuid();
                     uc.gid = ctx->root_identity ? 0 : (uint32_t) getgid();
-                    if (guest_mem_write(ctx, pid, optval_ptr, &uc, sizeof(uc)) >=
-                        0) {
+                    if (guest_mem_write(ctx, pid, optval_ptr, &uc,
+                                        sizeof(uc)) >= 0) {
                         unsigned int out_len = sizeof(uc);
                         (void) guest_mem_write(ctx, pid, optlen_ptr, &out_len,
                                                sizeof(out_len));
@@ -1648,7 +1648,8 @@ struct kbox_dispatch forward_getsockopt(const struct kbox_syscall_request *req,
         memcpy(&so_error, optval, sizeof(so_error));
         if (getenv("KBOX_SOERR_TRACE"))
             fprintf(stderr,
-                    "kbox: soerr fd=%ld lkl=%ld entry=%p shadow=%d err=%d conn=%d est=%d\n",
+                    "kbox: soerr fd=%ld lkl=%ld entry=%p shadow=%d err=%d "
+                    "conn=%d est=%d\n",
                     fd, lkl_fd, (void *) entry,
                     entry ? (int) entry->shadow_sp : -1, so_error,
                     entry ? (int) entry->sock_connected : -1,

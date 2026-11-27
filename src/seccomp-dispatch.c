@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
@@ -255,31 +256,9 @@ int request_addfd_passthrough(const struct kbox_supervisor_ctx *ctx,
     if (!ctx || !req)
         return -EINVAL;
 
-    if (ctx->fd_inject_ops && ctx->fd_inject_ops->addfd_at) {
-        /* The band is closed by the kernel, so the fd table's low slot is only
-         * bookkeeping: after a native close it still says SHADOW_ONLY although
-         * the tracee's number is free again. Ask the tracee, not the table, so
-         * the band is reused instead of filling up and falling back to numbers
-         * whose close is notified (and can be lost). */
-        int target = find_available_tracee_fd(
-            NULL, kbox_syscall_request_pid(req), KBOX_FD_PIPE_BASE);
-        if (target >= KBOX_FD_PIPE_BASE && target < KBOX_FD_PIPE_TOP) {
-            int r = ctx->fd_inject_ops->addfd_at(
-                ctx, kbox_syscall_request_cookie(req), srcfd, target,
-                newfd_flags);
-            if (r >= 0) {
-                if (getenv("KBOX_FD_TRACE"))
-                    fprintf(stderr, "kbofdt: addfd-band pid=%u src=%d fd=%d\n",
-                            (unsigned) kbox_syscall_request_pid(req), srcfd, r);
-                return r;
-            }
-            /* EPERM/ENOSYS: this kernel or container cannot install at a
-             * chosen descriptor. Fall back to the lowest free number, which
-             * keeps the work that triggered this from failing. */
-            if (r != -EPERM && r != -ENOSYS && r != -EINVAL)
-                return r;
-        }
-    }
+    /* Every fd call is notified and this side decides ownership from its own
+     * table, so a passthrough descriptor needs no reserved band: it takes the
+     * lowest free number like any other descriptor. */
     return request_addfd(ctx, req, srcfd, newfd_flags);
 }
 
@@ -344,7 +323,7 @@ uint64_t kbox_guest_fd_identity(pid_t pid, long fd)
     char path[64];
     struct stat st;
 
-    if (fd < 0 || fd >= KBOX_FD_BASE) {
+    if (fd < 0 || fd >= KBOX_FD_TABLE_CAPACITY) {
         errno = EINVAL;
         return 0;
     }
@@ -365,7 +344,7 @@ static void note_low_fd_identity(struct kbox_supervisor_ctx *ctx,
 {
     struct kbox_fd_entry *entry;
 
-    if (!ctx || !ctx->fd_table || fd < 0 || fd >= KBOX_FD_BASE)
+    if (!ctx || !ctx->fd_table || fd < 0 || fd >= KBOX_FD_TABLE_CAPACITY)
         return;
     entry = fd_table_entry(ctx->fd_table, fd);
     if (!entry || entry->lkl_fd < 0)
@@ -406,14 +385,14 @@ void kbox_retire_stale_host_fd_vfd(struct kbox_supervisor_ctx *ctx,
                                    long host_fd,
                                    int force)
 {
-    if (!ctx || !ctx->fd_table || host_fd < 0 || host_fd >= KBOX_FD_BASE)
+    if (!ctx || !ctx->fd_table || host_fd < 0 ||
+        host_fd >= KBOX_FD_TABLE_CAPACITY)
         return;
 
-    /* A low descriptor's close runs in the kernel (item 33), so a bridged
-     * socket stored at vfd >= KBOX_FD_BASE with host_fd < KBOX_FD_BASE stays
-     * in the table until retired. Retire any stale entry claiming host_fd so a
-     * new socket, pipe or file on that number is never routed to the old LKL
-     * socket (item 37). */
+    /* A descriptor's close can run in the kernel without the table hearing
+     * about it, so a bridged entry that claims this host_fd stays behind.
+     * Retire it, or a new socket, pipe or file on that number is routed to the
+     * old LKL object. */
     for (int guard = 0; guard < 16; guard++) {
         long vfd = kbox_fd_table_find_by_host_fd(ctx->fd_table, host_fd);
         struct kbox_fd_entry *e;
@@ -447,17 +426,16 @@ static void sweep_bridged_table(struct kbox_supervisor_ctx *ctx,
         while (bits) {
             unsigned b = (unsigned) __builtin_ctzll(bits);
             long i = (long) (w * 64 + b);
-            struct kbox_fd_entry *e = &table->slots[KBOX_FD_BASE + i];
+            struct kbox_fd_entry *e = &table->slots[i];
 
             bits &= bits - 1;
             if (e->lkl_fd < 0 || e->shadow_sp < 0 || e->host_fd < 0 ||
-                e->host_fd >= KBOX_FD_BASE || e->guest_id == 0)
+                e->host_fd == i || e->guest_id == 0)
                 continue;
             uint64_t now = kbox_guest_fd_identity(owner_pid, e->host_fd);
 
             if (kbox_fd_identity_stale(e->guest_id, now, errno))
-                retire_host_fd_vfd_in_table(ctx, table, KBOX_FD_BASE + i,
-                                            e->host_fd);
+                retire_host_fd_vfd_in_table(ctx, table, i, e->host_fd);
         }
     }
 }
@@ -555,7 +533,7 @@ static void sweep_stale_low_fds(struct kbox_supervisor_ctx *ctx,
 
     if (!ctx || !ctx->fd_table || pid <= 0)
         return;
-    limit = max_fd < KBOX_LOW_FD_MAX ? max_fd : KBOX_LOW_FD_MAX;
+    limit = max_fd < KBOX_FD_TABLE_CAPACITY ? max_fd : KBOX_FD_TABLE_CAPACITY;
 
     for (fd = 0; fd < limit; fd++) {
         struct kbox_fd_entry *entry = &ctx->fd_table->slots[fd];
@@ -660,7 +638,7 @@ static void validate_low_fd_routing(struct kbox_supervisor_ctx *ctx,
         struct kbox_fd_entry *entry;
         long fd = fds[i];
 
-        if (fd < 0 || fd >= KBOX_FD_BASE)
+        if (fd < 0 || fd >= KBOX_FD_TABLE_CAPACITY)
             continue;
         kbox_retire_stale_host_fd_vfd(ctx, pid, fd, 0);
         entry = fd_table_entry(ctx->fd_table, fd);
@@ -2421,7 +2399,7 @@ static void fd_trace_dump(const struct kbox_fd_table *t, const char *why)
     if (!fd_trace_enabled() || !t)
         return;
     fprintf(stderr, "kbofdt: dump %s\n", why);
-    for (long fd = KBOX_FD_BASE; fd < KBOX_FD_BASE + KBOX_FD_TABLE_MAX; fd++) {
+    for (long fd = 0; fd < KBOX_FD_TABLE_CAPACITY; fd++) {
         const struct kbox_fd_entry *e = &t->slots[fd];
         int found = 0;
 
@@ -2464,114 +2442,80 @@ static void fd_trace_table(const char *tag,
                            const struct kbox_fd_table *t,
                            pid_t tgid)
 {
-    long fast = 0, base = 0;
-    unsigned total;
-
     if (!fd_trace_enabled() || !t)
         return;
-    for (long fd = KBOX_FD_FAST_BASE; fd < KBOX_FD_HOSTONLY_BASE; fd++) {
-        const struct kbox_fd_entry *e = &t->slots[fd];
-
-        if (e->lkl_fd != -1)
-            fast++;
-    }
-    for (long fd = KBOX_FD_BASE; fd < KBOX_FD_FAST_BASE; fd++) {
-        const struct kbox_fd_entry *e = &t->slots[fd];
-
-        if (e->lkl_fd != -1)
-            base++;
-    }
-    total = kbox_fd_table_count(t);
-    fprintf(stderr,
-            "kbofdt: table %s tgid=%d ptr=%p total=%u base_band=%ld "
-            "fast_band=%ld\n",
-            tag, (int) tgid, (const void *) t, total, base, fast);
+    fprintf(stderr, "kbofdt: table %s tgid=%d ptr=%p total=%u\n", tag,
+            (int) tgid, (const void *) t, kbox_fd_table_count(t));
 }
 
-long allocate_passthrough_hostonly_fd(struct kbox_supervisor_ctx *ctx)
-{
-    long base_fd = KBOX_FD_HOSTONLY_BASE;
-    long end_fd = KBOX_FD_BASE + KBOX_FD_TABLE_MAX;
-    long start_fd;
-    long fd;
-
-    if (!ctx || !ctx->fd_table)
-        return -1;
-
-    start_fd = ctx->fd_table->next_hostonly_fd;
-    if (start_fd < base_fd || start_fd >= end_fd)
-        start_fd = base_fd;
-
-    for (fd = start_fd; fd < end_fd; fd++) {
-        if (!child_fd_is_open(ctx, fd)) {
-            ctx->fd_table->next_hostonly_fd = fd + 1;
-            return fd;
-        }
-    }
-    for (fd = base_fd; fd < start_fd; fd++) {
-        if (!child_fd_is_open(ctx, fd)) {
-            ctx->fd_table->next_hostonly_fd = fd + 1;
-            return fd;
-        }
-    }
-
-    return -1;
-}
-
-long next_hostonly_fd_hint(const struct kbox_supervisor_ctx *ctx)
-{
-    long fd;
-    long end_fd = KBOX_FD_BASE + KBOX_FD_TABLE_MAX;
-
-    if (!ctx || !ctx->fd_table)
-        return -1;
-
-    fd = ctx->fd_table->next_hostonly_fd;
-    if (fd < KBOX_FD_HOSTONLY_BASE || fd >= end_fd)
-        fd = KBOX_FD_HOSTONLY_BASE;
-    return fd;
-}
-
+/* Lowest descriptor whose slot is free and which the
+ * tracee does not already hold. Ownership comes from the table, never from the
+ * number. */
 static long allocate_shadow_fd_from(struct kbox_supervisor_ctx *ctx,
                                     long min_fd)
 {
-    long base_fd = KBOX_FD_FAST_BASE;
-    long end_fd = KBOX_FD_HOSTONLY_BASE;
-    long start_fd;
+    long end_fd = KBOX_FD_TABLE_CAPACITY;
     long fd;
 
-    if (!ctx || !ctx->fd_table || min_fd >= end_fd)
+    if (!ctx || !ctx->fd_table)
         return -1;
-    if (min_fd < base_fd)
-        min_fd = base_fd;
+    if (min_fd < 0)
+        min_fd = 0;
 
-    start_fd = ctx->fd_table->next_fast_fd;
-    if (start_fd < min_fd || start_fd >= end_fd)
-        start_fd = min_fd;
-
-    for (fd = start_fd; fd < end_fd; fd++) {
+    for (fd = min_fd; fd < end_fd; fd++) {
         struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
 
-        if (entry && entry->lkl_fd == -1 && !child_fd_is_open(ctx, fd)) {
-            ctx->fd_table->next_fast_fd = fd + 1;
+        if (entry && entry->lkl_fd == -1 && !child_fd_is_open(ctx, fd))
             return fd;
-        }
     }
-    for (fd = min_fd; fd < start_fd; fd++) {
-        struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
-
-        if (entry && entry->lkl_fd == -1 && !child_fd_is_open(ctx, fd)) {
-            ctx->fd_table->next_fast_fd = fd + 1;
-            return fd;
-        }
-    }
-
     return -1;
 }
 
 static long allocate_writable_shadow_fd(struct kbox_supervisor_ctx *ctx)
 {
-    return allocate_shadow_fd_from(ctx, KBOX_FD_FAST_BASE);
+    return allocate_shadow_fd_from(ctx, KBOX_NATIVE_CLOSE_MAX);
+}
+
+/* Install a real host placeholder descriptor at a low virtual FD
+ * (< KBOX_NATIVE_CLOSE_MAX) that has no same-fd shadow. Because close(fd)
+ * below KBOX_NATIVE_CLOSE_MAX runs natively in the host kernel, the tracee
+ * must hold a real descriptor at that number so close() returns 0 instead of
+ * EBADF (e.g. dup2/F_DUPFD of a directory or writable LKL file). A zero-byte
+ * memfd gives each placeholder a unique (st_dev, st_ino) so
+ * validate_low_fd_routing() detects close or reuse immediately.
+ */
+static int close_watch_register(struct kbox_supervisor_ctx *ctx,
+                                int memfd,
+                                long lkl_fd,
+                                int shadow_sp,
+                                const struct kbox_fd_entry *src);
+
+static void install_low_vfd_placeholder(struct kbox_supervisor_ctx *ctx,
+                                        const struct kbox_syscall_request *req,
+                                        long fd,
+                                        int cloexec)
+{
+    struct kbox_fd_entry *entry;
+    long lkl_fd = -1;
+    int wd = -1;
+    int pfd;
+
+    if (!ctx || !req || fd < 0 || fd >= KBOX_FD_TABLE_CAPACITY)
+        return;
+    entry = fd_table_entry(ctx->fd_table, fd);
+    if (entry)
+        lkl_fd = entry->lkl_fd;
+    pfd = memfd_create("kbox-vfd", MFD_CLOEXEC);
+    if (pfd < 0)
+        return;
+    /* Registered before the descriptor reaches the guest, so the close that
+     * follows immediately is never missed. */
+    wd = close_watch_register(ctx, pfd, lkl_fd, -1, entry);
+    (void) request_addfd_at(ctx, req, pfd, (int) fd, cloexec ? O_CLOEXEC : 0);
+    close(pfd);
+    if (wd >= 0 && entry)
+        entry->watch_wd = wd;
+    note_low_fd_identity(ctx, kbox_syscall_request_pid(req), fd);
 }
 
 static long allocate_dup_shadow_fd_from(struct kbox_supervisor_ctx *ctx,
@@ -2579,7 +2523,7 @@ static long allocate_dup_shadow_fd_from(struct kbox_supervisor_ctx *ctx,
                                         long min_fd)
 {
     long fd;
-    long max_fd = KBOX_FD_BASE + KBOX_FD_TABLE_MAX;
+    long max_fd = KBOX_FD_TABLE_CAPACITY;
 
     if (!ctx || !ctx->fd_table)
         return -1;
@@ -3120,6 +3064,32 @@ static struct kbox_dispatch finish_open_dispatch(
 {
     struct kbox_dispatch shadow_dispatch;
 
+    /* Honor POSIX lowest-fd semantics when a stdio descriptor (0/1/2) is
+     * closed (e.g. close(1); open("/tmp/out", ...)). Stay on direct LKL I/O
+     * (skip writeback shadow) and install a placeholder fd so native close()
+     * succeeds with 0 and writes are immediately durable. */
+    if (req && req->source == KBOX_SYSCALL_SOURCE_SECCOMP) {
+        pid_t pid = kbox_syscall_request_pid(req);
+        long stdio_fd;
+
+        for (stdio_fd = 0; stdio_fd <= 2; stdio_fd++) {
+            if (!pid_fd_is_open(pid, stdio_fd)) {
+                sweep_stale_low_fds(ctx, pid, 3);
+                if (kbox_fd_table_get_lkl(ctx->fd_table, stdio_fd) == -1 &&
+                    kbox_fd_table_insert_at(
+                        ctx->fd_table, stdio_fd, lkl_fd,
+                        kbox_is_tty_like_path(translated)) == 0) {
+                    if (flags & O_CLOEXEC)
+                        kbox_fd_table_set_cloexec(ctx->fd_table, stdio_fd, 1);
+                    install_low_vfd_placeholder(ctx, req, stdio_fd,
+                                                (flags & O_CLOEXEC) != 0);
+                    return kbox_dispatch_value((int64_t) stdio_fd);
+                }
+                break;
+            }
+        }
+    }
+
     if (req && try_cached_shadow_open_dispatch(ctx, req, flags, translated,
                                                &shadow_dispatch)) {
         return shadow_dispatch;
@@ -3144,11 +3114,9 @@ static struct kbox_dispatch finish_open_dispatch(
             fd_trace_dump(ctx->fd_table, translated ? translated : "?");
             fprintf(stderr,
                     "kbofdt: insert-failed path=%s child_pid=%d alive=%d "
-                    "next_fd=%ld next_fast=%ld next_hostonly=%ld\n",
+                    "next_fd=%ld\n",
                     translated ? translated : "?", (int) ctx->child_pid,
-                    proc_ok, ctx->fd_table->next_fd,
-                    ctx->fd_table->next_fast_fd,
-                    ctx->fd_table->next_hostonly_fd);
+                    proc_ok, ctx->fd_table->next_fd);
         }
         lkl_close_and_invalidate(ctx, lkl_fd);
         return kbox_dispatch_errno(EMFILE);
@@ -4179,7 +4147,7 @@ static int try_cgroup_limit_open(struct kbox_supervisor_ctx *ctx,
     close(memfd);
     if (tracee_fd < 0)
         return 0;
-    if (tracee_fd < KBOX_FD_BASE)
+    if (tracee_fd >= 0)
         kbox_retire_stale_host_fd_vfd(ctx, kbox_syscall_request_pid(req),
                                       tracee_fd, 1);
     track_host_passthrough_fd(ctx->fd_table, tracee_fd);
@@ -4307,7 +4275,7 @@ static struct kbox_dispatch finish_host_open_tracked(
         return kbox_dispatch_errno(-tracee_fd);
     }
 
-    if (tracee_fd < KBOX_FD_BASE)
+    if (tracee_fd >= 0)
         kbox_retire_stale_host_fd_vfd(ctx, kbox_syscall_request_pid(req),
                                       tracee_fd, 1);
     track_host_passthrough_fd(ctx->fd_table, tracee_fd);
@@ -5160,7 +5128,7 @@ static int try_open_virtual_fd_link(struct kbox_supervisor_ctx *ctx,
         kbox_shadow_seal(sp);
     }
 
-    target = allocate_shadow_fd_from(ctx, KBOX_FD_FAST_BASE);
+    target = allocate_shadow_fd_from(ctx, KBOX_NATIVE_CLOSE_MAX);
     if (target < 0) {
         close(sp);
         return 0;
@@ -5581,6 +5549,181 @@ int sync_shadow_writeback(struct kbox_supervisor_ctx *ctx,
 
 /* forward_close. */
 
+/* Close watches.
+ *
+ * A guest descriptor is a memfd on the host, and its close runs in the host
+ * kernel without reaching the supervisor. An inotify watch on the memfd's
+ * inode reports the moment the last reference disappears, which is exactly
+ * when the LKL descriptor and the shadow must be released. The watch is keyed
+ * by the watch descriptor the kernel hands back; the LKL side belongs to the
+ * open file description, not to any single descriptor slot.
+ */
+
+static int close_watch_init(struct kbox_supervisor_ctx *ctx)
+{
+    if (ctx->close_inotify_fd >= 0)
+        return 0;
+    ctx->close_inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    return ctx->close_inotify_fd < 0 ? -1 : 0;
+}
+
+static struct kbox_vfd_watch *close_watch_find(struct kbox_supervisor_ctx *ctx,
+                                               int wd)
+{
+    for (size_t i = 0; i < ctx->close_watch_count; i++)
+        if (ctx->close_watches[i].in_use && ctx->close_watches[i].wd == wd)
+            return &ctx->close_watches[i];
+    return NULL;
+}
+
+static struct kbox_vfd_watch *close_watch_alloc(struct kbox_supervisor_ctx *ctx)
+{
+    for (size_t i = 0; i < ctx->close_watch_count; i++)
+        if (!ctx->close_watches[i].in_use)
+            return &ctx->close_watches[i];
+    if (ctx->close_watch_count == ctx->close_watch_cap) {
+        size_t cap = ctx->close_watch_cap ? ctx->close_watch_cap * 2 : 64;
+        struct kbox_vfd_watch *grown;
+
+        if (cap > SIZE_MAX / sizeof(*grown))
+            return NULL;
+        grown = realloc(ctx->close_watches, sizeof(*grown) * cap);
+        if (!grown)
+            return NULL;
+        memset(grown + ctx->close_watch_cap, 0,
+               sizeof(*grown) * (cap - ctx->close_watch_cap));
+        ctx->close_watches = grown;
+        ctx->close_watch_cap = cap;
+    }
+    return &ctx->close_watches[ctx->close_watch_count++];
+}
+
+/* Free what the description owned. Called once, when the kernel says the last
+ * guest reference is gone. */
+static void close_watch_release(struct kbox_supervisor_ctx *ctx,
+                                struct kbox_vfd_watch *w,
+                                int ignored)
+{
+    if (ctx->fd_table) {
+        /* next_fd is the highest number ever handed out, so nothing above it
+         * can still hold this watch; scanning the whole array on every close
+         * costs far more than the bookkeeping is worth. */
+        long limit = ctx->fd_table->next_fd + 1;
+
+        if (limit > KBOX_FD_TABLE_CAPACITY)
+            limit = KBOX_FD_TABLE_CAPACITY;
+        for (long fd = 0; fd < limit; fd++) {
+            struct kbox_fd_entry *e = fd_table_entry(ctx->fd_table, fd);
+
+            if (e && e->watch_wd == w->wd)
+                kbox_fd_table_remove(ctx->fd_table, fd);
+        }
+    }
+    if (w->shadow_writeback) {
+        struct kbox_fd_entry tmp;
+
+        memset(&tmp, 0, sizeof(tmp));
+        tmp.lkl_fd = w->lkl_fd;
+        tmp.host_fd = -1;
+        tmp.host_sv_fd = -1;
+        tmp.shadow_sp = w->shadow_sp;
+        tmp.shadow_writeback = w->shadow_writeback;
+        tmp.shadow_mtime_sec = w->shadow_mtime_sec;
+        tmp.shadow_mtime_nsec = w->shadow_mtime_nsec;
+        tmp.shadow_size = w->shadow_size;
+        (void) sync_shadow_writeback(ctx, &tmp);
+    }
+    if (w->lkl_fd >= 0)
+        invalidate_stat_cache_fd(ctx, w->lkl_fd);
+    if (!ignored && w->wd >= 0 && ctx->close_inotify_fd >= 0)
+        (void) inotify_rm_watch(ctx->close_inotify_fd, w->wd);
+    if (w->lkl_fd >= 0)
+        ctx_close_lkl_if_unreferenced(ctx, w->lkl_fd, 0);
+    if (w->shadow_sp >= 0)
+        close(w->shadow_sp);
+    w->in_use = 0;
+}
+
+void kbox_drain_close_watches(struct kbox_supervisor_ctx *ctx)
+{
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+
+    if (!ctx || ctx->close_inotify_fd < 0)
+        return;
+    for (;;) {
+        ssize_t got = read(ctx->close_inotify_fd, buf, sizeof(buf));
+        ssize_t off = 0;
+
+        if (got < 0) {
+            if (errno == EINTR)
+                continue;
+            return;
+        }
+        if (got == 0)
+            return;
+        while (off + (ssize_t) sizeof(struct inotify_event) <= got) {
+            struct inotify_event *e = (struct inotify_event *) (buf + off);
+            struct kbox_vfd_watch *w;
+
+            off += (ssize_t) (sizeof(*e) + e->len);
+            if (e->mask & IN_Q_OVERFLOW) {
+                fprintf(stderr, "kbox: close watch queue overflowed\n");
+                continue;
+            }
+            if (!(e->mask & (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)))
+                continue;
+            w = close_watch_find(ctx, e->wd);
+            if (!w)
+                continue;
+            close_watch_release(ctx, w, (e->mask & IN_IGNORED) != 0);
+        }
+        if ((size_t) got < sizeof(buf))
+            return;
+    }
+}
+
+/* Start watching a memfd that the guest is about to hold. Returns the watch
+ * descriptor, or -1 when watching is not possible (the descriptor then keeps
+ * the old, notification-based close handling). */
+static int close_watch_register(struct kbox_supervisor_ctx *ctx,
+                                int memfd,
+                                long lkl_fd,
+                                int shadow_sp,
+                                const struct kbox_fd_entry *src)
+{
+    char path[64];
+    struct kbox_vfd_watch *w;
+    int wd;
+
+    if (!ctx || memfd < 0 || close_watch_init(ctx) != 0)
+        return -1;
+    if (snprintf(path, sizeof(path), "/proc/self/fd/%d", memfd) >=
+        (int) sizeof(path))
+        return -1;
+    wd = inotify_add_watch(ctx->close_inotify_fd, path,
+                           IN_CLOSE_WRITE | IN_CLOSE_NOWRITE);
+    if (wd < 0)
+        return -1;
+    w = close_watch_alloc(ctx);
+    if (!w) {
+        (void) inotify_rm_watch(ctx->close_inotify_fd, wd);
+        return -1;
+    }
+    memset(w, 0, sizeof(*w));
+    w->wd = wd;
+    w->lkl_fd = lkl_fd;
+    w->shadow_sp = shadow_sp;
+    if (src) {
+        w->shadow_writeback = src->shadow_writeback;
+        w->shadow_mtime_sec = src->shadow_mtime_sec;
+        w->shadow_mtime_nsec = src->shadow_mtime_nsec;
+        w->shadow_size = src->shadow_size;
+        w->guest_id = src->guest_id;
+    }
+    w->in_use = 1;
+    return wd;
+}
+
 static struct kbox_dispatch forward_close(
     const struct kbox_syscall_request *req,
     struct kbox_supervisor_ctx *ctx)
@@ -5588,6 +5731,7 @@ static struct kbox_dispatch forward_close(
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
     struct kbox_fd_entry *entry = fd_table_entry(ctx->fd_table, fd);
+
     int same_fd_shadow = entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW;
     kbox_net_forget_fd(fd);
     if (fd_trace_enabled())
@@ -5633,7 +5777,7 @@ static struct kbox_dispatch forward_close(
     }
 
     if (lkl_fd >= 0) {
-        if ((ctx->verbose || getenv("KBOX_FD_TRACE")) && fd >= KBOX_FD_BASE)
+        if ((ctx->verbose || getenv("KBOX_FD_TRACE")) && fd >= 0)
             fprintf(stderr,
                     "kbox: close vfd=%ld lkl=%ld host_fd=%ld shadow_sp=%d "
                     "writeback=%d\n",
@@ -5654,7 +5798,7 @@ static struct kbox_dispatch forward_close(
 
         kbox_fd_table_remove(ctx->fd_table, fd);
         long ret = ctx_close_lkl_if_unreferenced(ctx, lkl_fd, 0);
-        if (ret < 0 && fd >= KBOX_FD_BASE) {
+        if (ret < 0 && fd >= 0) {
             if (fd_trace_enabled())
                 fprintf(stderr,
                         "kbofdt: close-act fd=%ld act=vfd-errno ret=%ld\n", fd,
@@ -5662,26 +5806,20 @@ static struct kbox_dispatch forward_close(
             return kbox_dispatch_errno((int) (-ret));
         }
 
-        /* Low FD redirect (from dup2/dup3): the LKL side is closed above.
-         * Do NOT continue to the host: a redirect onto 0/1/2 replaces the
-         * host descriptor with a purely virtual one, and shells do close the
-         * real stdio descriptor beforehand -- so there is nothing left at that
-         * number and the host would answer EBADF for a close that the guest
-         * has every right to expect to succeed. dash reports exactly that
-         * ("cat: closing standard input: Bad file descriptor") and then
-         * refuses to run, which is what broke postgres' bootstrap.
+        /* A redirect onto a number the host no longer holds must still answer
+         * success: shells close the real stdio descriptor before pointing the
+         * number at a virtual one, and the host would answer EBADF for a close
+         * the guest has every right to expect to succeed. When the tracee does
+         * hold a descriptor at this number, the close is passed through so the
+         * kernel releases it too; a virtual descriptor that shares its number
+         * with an injected shadow would otherwise leak on this side.
          */
-        if (fd < KBOX_LOW_FD_MAX) {
-            /* The branch that answers a low descriptor without letting the
-             * kernel close anything. If a leaked pipe end is answered here,
-             * the guest's virtual fd and the host's fd have drifted apart. */
+        if (child_fd_is_open(ctx, fd)) {
             if (fd_trace_enabled())
-                fprintf(stderr,
-                        "kbofdt: close-act fd=%ld act=vfd-value0-low lkl=%ld\n",
-                        fd, lkl_fd);
-            return kbox_dispatch_value(0);
+                fprintf(stderr, "kbofdt: close-act fd=%ld act=vfd-continue\n",
+                        fd);
+            return kbox_dispatch_continue();
         }
-
         if (fd_trace_enabled())
             fprintf(stderr, "kbofdt: close-act fd=%ld act=vfd-value0 lkl=%ld\n",
                     fd, lkl_fd);
@@ -5889,7 +6027,7 @@ static struct kbox_dispatch forward_write(
     if (lkl_fd < 0)
         return kbox_dispatch_errno(EBADF);
     if (entry && entry->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW) {
-        if (getenv("KBOX_FD_TRACE") && fd >= KBOX_FD_BASE)
+        if (getenv("KBOX_FD_TRACE") && fd >= 0)
             /* format-ok: a literal, split only because the call
              * does not fit on one line. */
             fprintf(/* format-ok */
@@ -5901,7 +6039,7 @@ static struct kbox_dispatch forward_write(
                         kbox_syscall_request_arg(req, 2)));
         return kbox_dispatch_continue();
     }
-    if (getenv("KBOX_FD_TRACE") && fd >= KBOX_FD_BASE)
+    if (getenv("KBOX_FD_TRACE") && fd >= 0)
         fprintf(stderr,
                 "kbofdt: write fd=%ld lkl=%ld host_fd=%ld sp=%d n=%lld\n", fd,
                 lkl_fd, entry ? entry->host_fd : -99L,
@@ -5974,7 +6112,7 @@ static struct kbox_dispatch forward_write(
 
     if (total > 0)
         invalidate_path_shadow_cache(ctx);
-    if (getenv("KBOX_FD_TRACE") && fd >= KBOX_FD_BASE)
+    if (getenv("KBOX_FD_TRACE") && fd >= 0)
         fprintf(stderr, "kbofdt: write done fd=%ld lkl=%ld n=%lld total=%zu\n",
                 fd, lkl_fd,
                 (long long) to_c_long_arg(kbox_syscall_request_arg(req, 2)),
@@ -6639,7 +6777,7 @@ static struct kbox_dispatch dispatch_advisory_lock(
             kbox_lock_release_pid(&ctx->locks, slot->pid);
             continue;
         }
-        if (slot->guest_fd >= 0 && slot->guest_fd < KBOX_FD_BASE &&
+        if (slot->guest_fd >= 0 && slot->guest_fd < KBOX_FD_TABLE_CAPACITY &&
             slot->guest_id != 0) {
             uint64_t now = kbox_guest_fd_identity(slot->pid, slot->guest_fd);
 
@@ -6712,7 +6850,7 @@ static struct kbox_dispatch dispatch_advisory_lock(
     if (kbox_lock_apply(&ctx->locks, pid, ofd_key, kst.st_dev, kst.st_ino, type,
                         first, last) < 0)
         return kbox_dispatch_errno(ENOLCK);
-    if (type != F_UNLCK && fd >= 0 && fd < KBOX_FD_BASE) {
+    if (type != F_UNLCK && fd >= 0 && fd < KBOX_FD_TABLE_CAPACITY) {
         uint64_t gid = kbox_guest_fd_identity(pid, fd);
 
         if (gid != 0)
@@ -6775,7 +6913,7 @@ static struct kbox_dispatch forward_fcntl(
             close(copy);
             if (tracee_new < 0)
                 return kbox_dispatch_errno(-tracee_new);
-            if (tracee_new < KBOX_FD_BASE)
+            if (tracee_new >= 0)
                 kbox_retire_stale_host_fd_vfd(
                     ctx, kbox_syscall_request_pid(req), tracee_new, 1);
             track_host_passthrough_fd(ctx->fd_table, tracee_new);
@@ -6869,7 +7007,7 @@ static struct kbox_dispatch forward_fcntl(
          * native kernel pipe from item 33) must take the host-passthrough
          * path: F_SETFD/F_SETFL/F_GETFL continue to the host kernel, and
          * F_DUPFD/F_DUPFD_CLOEXEC track the duplicated fd (which busybox ash
-         * places above KBOX_FD_BASE when saving stdout across redirects).
+         * places elsewhere when saving stdout across redirects).
          */
         if (tracee_fd_is_open(kbox_syscall_request_pid(req), fd))
             goto fcntl_host_passthrough;
@@ -6935,7 +7073,7 @@ static struct kbox_dispatch forward_fcntl(
         if (arg < 0)
             return kbox_dispatch_errno(EINVAL);
         sweep_stale_low_fds(ctx, kbox_syscall_request_pid(req),
-                            KBOX_LOW_FD_MAX);
+                            KBOX_NATIVE_CLOSE_MAX);
         struct kbox_fd_entry *orig = fd_table_entry(ctx->fd_table, fd);
         if (orig && orig->host_fd == KBOX_FD_HOST_SAME_FD_SHADOW &&
             orig->shadow_sp >= 0) {
@@ -6953,23 +7091,23 @@ static struct kbox_dispatch forward_fcntl(
             return d;
         }
 
+        long new_vfd = allocate_dup_shadow_fd_from(
+            ctx, kbox_syscall_request_pid(req), arg);
+        if (new_vfd < 0)
+            return kbox_dispatch_errno(EMFILE);
+
         long ret = kbox_lkl_fcntl(ctx->sysnrs, lkl_fd, cmd, arg);
         if (ret < 0)
             return kbox_dispatch_errno((int) (-ret));
 
         int mirror = kbox_fd_table_mirror_tty(ctx->fd_table, fd);
-        long new_vfd =
-            kbox_fd_table_insert_from(ctx->fd_table, arg, ret, mirror);
-        if (new_vfd < 0 ||
-            (ctx->active_proc &&
-             (uint64_t) new_vfd >= ctx->active_proc->rlimit_nofile_cur)) {
-            if (new_vfd >= 0)
-                kbox_fd_table_remove(ctx->fd_table, new_vfd);
+        if (kbox_fd_table_insert_at(ctx->fd_table, new_vfd, ret, mirror) < 0) {
             lkl_close_and_invalidate(ctx, ret);
             return kbox_dispatch_errno(EMFILE);
         }
-        if (new_vfd < KBOX_LOW_FD_MAX)
-            note_low_fd_identity(ctx, kbox_syscall_request_pid(req), new_vfd);
+        if (new_vfd < KBOX_NATIVE_CLOSE_MAX)
+            install_low_vfd_placeholder(ctx, req, new_vfd,
+                                        cmd == F_DUPFD_CLOEXEC);
         if (cmd == F_DUPFD_CLOEXEC)
             kbox_fd_table_set_cloexec(ctx->fd_table, new_vfd, 1);
         return kbox_dispatch_value((int64_t) new_vfd);
@@ -7319,7 +7457,8 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
     long fd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
     long lkl_fd;
 
-    sweep_stale_low_fds(ctx, kbox_syscall_request_pid(req), KBOX_LOW_FD_MAX);
+    sweep_stale_low_fds(ctx, kbox_syscall_request_pid(req),
+                        KBOX_NATIVE_CLOSE_MAX);
     lkl_fd = kbox_fd_table_get_lkl(ctx->fd_table, fd);
 
     if (lkl_fd == KBOX_LKL_FD_SHADOW_ONLY) {
@@ -7348,7 +7487,7 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
                                           tracee_fd, 1);
             return kbox_dispatch_errno(EMFILE);
         }
-        if (tracee_fd < KBOX_FD_BASE)
+        if (tracee_fd >= 0)
             kbox_retire_stale_host_fd_vfd(ctx, kbox_syscall_request_pid(req),
                                           tracee_fd, 1);
         track_host_passthrough_fd(ctx->fd_table, tracee_fd);
@@ -7416,25 +7555,22 @@ static struct kbox_dispatch forward_dup(const struct kbox_syscall_request *req,
         return dup_same_fd_shadow_to(req, ctx, orig, target_fd, 0, 0);
     }
 
+    long new_vfd =
+        allocate_dup_shadow_fd_from(ctx, kbox_syscall_request_pid(req), 0);
+    if (new_vfd < 0)
+        return kbox_dispatch_errno(EMFILE);
+
     long ret = kbox_lkl_dup(ctx->sysnrs, lkl_fd);
     if (ret < 0)
         return kbox_dispatch_errno((int) (-ret));
 
     int mirror = kbox_fd_table_mirror_tty(ctx->fd_table, fd);
-    /* dup() returns the lowest free descriptor. That is safe now that every fd
-     * call is notified: the supervisor resolves the owner from this table
-     * instead of the filter guessing from the number's range. */
-    long new_vfd = kbox_fd_table_insert_lowest(ctx->fd_table, ret, mirror);
-    if (new_vfd < 0 ||
-        (ctx->active_proc &&
-         (uint64_t) new_vfd >= ctx->active_proc->rlimit_nofile_cur)) {
-        if (new_vfd >= 0)
-            kbox_fd_table_remove(ctx->fd_table, new_vfd);
+    if (kbox_fd_table_insert_at(ctx->fd_table, new_vfd, ret, mirror) < 0) {
         lkl_close_and_invalidate(ctx, ret);
         return kbox_dispatch_errno(EMFILE);
     }
-    if (new_vfd < KBOX_LOW_FD_MAX)
-        note_low_fd_identity(ctx, kbox_syscall_request_pid(req), new_vfd);
+    if (new_vfd < KBOX_NATIVE_CLOSE_MAX)
+        install_low_vfd_placeholder(ctx, req, new_vfd, 0);
     return kbox_dispatch_value((int64_t) new_vfd);
 }
 
@@ -7561,7 +7697,7 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
      * bootstrap read its own input as EBADF and died with "input in flex
      * scanner failed".
      */
-    if (newfd < KBOX_LOW_FD_MAX) {
+    if (newfd < KBOX_NATIVE_CLOSE_MAX) {
         struct kbox_fd_entry *src = fd_table_entry(ctx->fd_table, oldfd);
         int memfd = (src && src->shadow_sp >= 0) ? src->shadow_sp : -1;
         int own_memfd = 0;
@@ -7577,10 +7713,14 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
 
         if (memfd != -2 && memfd < 0) {
             memfd = kbox_shadow_create_resilient(ctx, lkl_old);
-            if (memfd < 0)
-                return kbox_dispatch_errno(-memfd);
-            kbox_shadow_seal(memfd);
-            own_memfd = 1;
+            if (memfd < 0) {
+                /* Non-regular files (e.g. directories) cannot be shadowed into
+                 * a memfd; fall through to LKL dup + host placeholder fd. */
+                memfd = -2;
+            } else {
+                kbox_shadow_seal(memfd);
+                own_memfd = 1;
+            }
         }
 
         if (memfd != -2) {
@@ -7629,7 +7769,8 @@ static struct kbox_dispatch forward_dup2(const struct kbox_syscall_request *req,
         lkl_close_and_invalidate(ctx, ret);
         return kbox_dispatch_errno(EBADF);
     }
-    note_low_fd_identity(ctx, kbox_syscall_request_pid(req), newfd);
+    if (newfd < KBOX_NATIVE_CLOSE_MAX)
+        install_low_vfd_placeholder(ctx, req, newfd, 0);
     return kbox_dispatch_value((int64_t) newfd);
 }
 
@@ -7719,7 +7860,7 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
      * bootstrap read its own input as EBADF and died with "input in flex
      * scanner failed".
      */
-    if (newfd < KBOX_LOW_FD_MAX) {
+    if (newfd < KBOX_NATIVE_CLOSE_MAX) {
         struct kbox_fd_entry *src = fd_table_entry(ctx->fd_table, oldfd);
         int memfd = (src && src->shadow_sp >= 0) ? src->shadow_sp : -1;
         int own_memfd = 0;
@@ -7735,10 +7876,14 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
 
         if (memfd != -2 && memfd < 0) {
             memfd = kbox_shadow_create_resilient(ctx, lkl_old);
-            if (memfd < 0)
-                return kbox_dispatch_errno(-memfd);
-            kbox_shadow_seal(memfd);
-            own_memfd = 1;
+            if (memfd < 0) {
+                /* Non-regular files (e.g. directories) cannot be shadowed into
+                 * a memfd; fall through to LKL dup + host placeholder fd. */
+                memfd = -2;
+            } else {
+                kbox_shadow_seal(memfd);
+                own_memfd = 1;
+            }
         }
 
         if (memfd != -2) {
@@ -7785,7 +7930,8 @@ static struct kbox_dispatch forward_dup3(const struct kbox_syscall_request *req,
         lkl_close_and_invalidate(ctx, ret);
         return kbox_dispatch_errno(EBADF);
     }
-    note_low_fd_identity(ctx, kbox_syscall_request_pid(req), newfd);
+    if (newfd < KBOX_NATIVE_CLOSE_MAX)
+        install_low_vfd_placeholder(ctx, req, newfd, (flags & O_CLOEXEC) != 0);
     if (flags & O_CLOEXEC)
         kbox_fd_table_set_cloexec(ctx->fd_table, newfd, 1);
     return kbox_dispatch_value((int64_t) newfd);
@@ -10949,30 +11095,11 @@ struct kbox_dispatch kbox_dispatch_request(
     const struct kbox_syscall_request *req)
 {
     ensure_lkl_nofile_limit(ctx);
-    /* Every close of a low descriptor, logged before any dispatch, so a close
-     * that never reaches the handler can be told apart from a close the guest
-     * never issued. The descriptor leak in item 30 loses one close per burst.
-     */
-    if (ctx && req && getenv("KBOX_FD_TRACE") && ctx->host_nrs &&
-        (long) req->nr == (long) ctx->host_nrs->close &&
-        (long) req->args[0] < 64)
-        fprintf(stderr, "kbofdt: notify close pid=%u fd=%ld src=%d\n",
-                (unsigned) kbox_syscall_request_pid(req), (long) req->args[0],
-                (int) req->source);
-    /* Trace every call that touches the first few virtual FD numbers. A
-     * write that never reaches the dispatcher at all is a different defect
-     * from a write that lands on the wrong file, and only the call sequence
-     * tells them apart.
-     */
-    if (ctx && req && getenv("KBOX_FD_TRACE") &&
-        (long) req->args[0] >= KBOX_FD_BASE &&
-        (long) req->args[0] < KBOX_FD_BASE + 8)
-        fprintf(stderr, "kbofdt: call fd=%ld nr=%d (%s) a1=%#llx a2=%#llx\n",
-                (long) req->args[0], (int) req->nr,
-                syscall_name_from_nr(ctx->host_nrs, req->nr),
-                (unsigned long long) req->args[1],
-                (unsigned long long) req->args[2]);
-
+    /* Closes happen in the host kernel, so their effect arrives here as an
+     * event rather than a syscall. Draining before dispatch keeps the order
+     * the guest observes: a descriptor it closed is gone before its next
+     * syscall is answered. */
+    kbox_drain_close_watches(ctx);
     struct kbox_dispatch d = dispatch_request_impl(ctx, req);
     const char *name = NULL;
 

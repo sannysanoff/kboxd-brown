@@ -52,6 +52,7 @@ static inline void clear_fd_entry(struct kbox_fd_entry *e)
     e->sock_established = 0;
     e->shadow_mmap = 0;
     e->guest_id = 0;
+    e->watch_wd = -1;
 }
 
 /* Populate an already-free slot with a fresh lkl_fd and ownership flags. All
@@ -89,6 +90,7 @@ static inline void init_live_entry(struct kbox_fd_entry *e,
     e->sock_established = 0;
     e->shadow_mmap = 0;
     e->guest_id = 0;
+    e->watch_wd = -1;
 }
 
 /* Reverse-map and refcount maintenance helpers.
@@ -128,9 +130,12 @@ static inline void rev_host_set(struct kbox_fd_table *t, long host_fd, long vfd)
 {
     int32_t cur;
 
-    if (vfd >= KBOX_FD_BASE && vfd < KBOX_FD_BASE + KBOX_FD_TABLE_MAX &&
-        host_fd >= 0 && host_fd < KBOX_FD_BASE) {
-        size_t idx = (size_t) (vfd - KBOX_FD_BASE);
+    /* A bridged entry is one whose host descriptor lives at a different
+     * number than the guest descriptor: shadows at the same number are not
+     * bridged and need no sweeping. */
+    if (vfd >= 0 && vfd < KBOX_FD_TABLE_CAPACITY && host_fd >= 0 &&
+        host_fd != vfd) {
+        size_t idx = (size_t) vfd;
         uint64_t mask = 1ULL << (idx & 63U);
 
         if (!(t->low_host_bitmap[idx >> 6] & mask)) {
@@ -155,9 +160,9 @@ static inline void rev_host_clear(struct kbox_fd_table *t,
                                   long host_fd,
                                   long vfd)
 {
-    if (vfd >= KBOX_FD_BASE && vfd < KBOX_FD_BASE + KBOX_FD_TABLE_MAX &&
-        host_fd >= 0 && host_fd < KBOX_FD_BASE) {
-        size_t idx = (size_t) (vfd - KBOX_FD_BASE);
+    if (vfd >= 0 && vfd < KBOX_FD_TABLE_CAPACITY && host_fd >= 0 &&
+        host_fd != vfd) {
+        size_t idx = (size_t) vfd;
         uint64_t mask = 1ULL << (idx & 63U);
 
         if (t->low_host_bitmap[idx >> 6] & mask) {
@@ -206,23 +211,20 @@ void kbox_fd_table_init(struct kbox_fd_table *t)
         t->lkl_fd_refs[i] = 0;
     memset(t->low_host_bitmap, 0, sizeof(t->low_host_bitmap));
     t->low_host_count = 0;
-    t->next_fd = KBOX_FD_BASE;
-    t->next_fast_fd = KBOX_FD_FAST_BASE;
-    t->next_hostonly_fd = KBOX_FD_HOSTONLY_BASE;
+    t->next_fd = KBOX_NATIVE_CLOSE_MAX;
 }
 
-/* Auto-allocate from the virtual general band [KBOX_FD_BASE,
- * KBOX_FD_FAST_BASE).
- */
+/* Auto-allocate a virtual descriptor from [KBOX_NATIVE_CLOSE_MAX,
+ * KBOX_FD_TABLE_CAPACITY) so its close() is notified to the supervisor. */
 long kbox_fd_table_insert(struct kbox_fd_table *t, long lkl_fd, int mirror_tty)
 {
     long start_fd = t->next_fd;
     long fd;
 
-    if (start_fd < KBOX_FD_BASE || start_fd >= KBOX_FD_FAST_BASE)
-        start_fd = KBOX_FD_BASE;
+    if (start_fd < KBOX_NATIVE_CLOSE_MAX || start_fd >= KBOX_FD_TABLE_CAPACITY)
+        start_fd = KBOX_NATIVE_CLOSE_MAX;
 
-    for (fd = start_fd; fd < KBOX_FD_FAST_BASE; fd++) {
+    for (fd = start_fd; fd < KBOX_FD_TABLE_CAPACITY; fd++) {
         if (t->slots[fd].lkl_fd == -1) {
             init_live_entry(&t->slots[fd], lkl_fd, mirror_tty);
             lkl_ref_inc(t, lkl_fd);
@@ -231,8 +233,8 @@ long kbox_fd_table_insert(struct kbox_fd_table *t, long lkl_fd, int mirror_tty)
         }
     }
 
-    /* Wrap around: scan from KBOX_FD_BASE up to start_fd. */
-    for (fd = KBOX_FD_BASE; fd < start_fd; fd++) {
+    /* Wrap around: scan from KBOX_NATIVE_CLOSE_MAX up to start_fd. */
+    for (fd = KBOX_NATIVE_CLOSE_MAX; fd < start_fd; fd++) {
         if (t->slots[fd].lkl_fd == -1) {
             init_live_entry(&t->slots[fd], lkl_fd, mirror_tty);
             lkl_ref_inc(t, lkl_fd);
@@ -245,8 +247,8 @@ long kbox_fd_table_insert(struct kbox_fd_table *t, long lkl_fd, int mirror_tty)
      * shows up here too, so say how full the pool is when it runs out. */
     {
         long live = 0;
-        long cap = KBOX_FD_FAST_BASE - KBOX_FD_BASE;
-        for (fd = KBOX_FD_BASE; fd < KBOX_FD_FAST_BASE; fd++)
+        long cap = KBOX_FD_TABLE_CAPACITY - KBOX_NATIVE_CLOSE_MAX;
+        for (fd = KBOX_NATIVE_CLOSE_MAX; fd < KBOX_FD_TABLE_CAPACITY; fd++)
             if (t->slots[fd].lkl_fd != -1)
                 live++;
         fprintf(stderr, "kbox: virtual fd table full (%ld live of %ld)\n", live,
@@ -265,7 +267,7 @@ long kbox_fd_table_insert_from(struct kbox_fd_table *t,
     if (min_fd < 0)
         min_fd = 0;
 
-    for (fd = min_fd; fd < KBOX_FD_BASE; fd++) {
+    for (fd = min_fd; fd < KBOX_FD_TABLE_CAPACITY; fd++) {
         if (t->slots[fd].lkl_fd == -1) {
             init_live_entry(&t->slots[fd], lkl_fd, mirror_tty);
             lkl_ref_inc(t, lkl_fd);
@@ -273,7 +275,7 @@ long kbox_fd_table_insert_from(struct kbox_fd_table *t,
         }
     }
 
-    return kbox_fd_table_insert(t, lkl_fd, mirror_tty);
+    return -1;
 }
 
 long kbox_fd_table_insert_lowest(struct kbox_fd_table *t,
@@ -281,37 +283,6 @@ long kbox_fd_table_insert_lowest(struct kbox_fd_table *t,
                                  int mirror_tty)
 {
     return kbox_fd_table_insert_from(t, 0, lkl_fd, mirror_tty);
-}
-
-long kbox_fd_table_insert_fast(struct kbox_fd_table *t,
-                               long lkl_fd,
-                               int mirror_tty)
-{
-    long start_fd = t->next_fast_fd;
-    long fd;
-
-    if (start_fd < KBOX_FD_FAST_BASE || start_fd >= KBOX_FD_HOSTONLY_BASE)
-        start_fd = KBOX_FD_FAST_BASE;
-
-    for (fd = start_fd; fd < KBOX_FD_HOSTONLY_BASE; fd++) {
-        if (t->slots[fd].lkl_fd == -1) {
-            init_live_entry(&t->slots[fd], lkl_fd, mirror_tty);
-            lkl_ref_inc(t, lkl_fd);
-            t->next_fast_fd = fd + 1;
-            return fd;
-        }
-    }
-
-    for (fd = KBOX_FD_FAST_BASE; fd < start_fd; fd++) {
-        if (t->slots[fd].lkl_fd == -1) {
-            init_live_entry(&t->slots[fd], lkl_fd, mirror_tty);
-            lkl_ref_inc(t, lkl_fd);
-            t->next_fast_fd = fd + 1;
-            return fd;
-        }
-    }
-
-    return -1;
 }
 
 int kbox_fd_table_insert_at(struct kbox_fd_table *t,
@@ -341,8 +312,8 @@ int kbox_fd_table_insert_at(struct kbox_fd_table *t,
     init_live_entry(e, lkl_fd, mirror_tty);
     lkl_ref_inc(t, lkl_fd);
 
-    /* Keep next_fd ahead of the highest occupied high-range slot. */
-    if (fd >= KBOX_FD_BASE && fd >= t->next_fd)
+    /* Keep next_fd ahead of the highest occupied slot. */
+    if (fd >= t->next_fd)
         t->next_fd = fd + 1;
 
     return 0;
@@ -387,19 +358,8 @@ long kbox_fd_table_remove(struct kbox_fd_table *t, long fd)
         close(e->shadow_sp);
 #endif
     clear_fd_entry(e);
-    if (fd >= KBOX_FD_HOSTONLY_BASE && fd < KBOX_FD_BASE + KBOX_FD_TABLE_MAX &&
-        (t->next_hostonly_fd < KBOX_FD_HOSTONLY_BASE ||
-         fd < t->next_hostonly_fd)) {
-        t->next_hostonly_fd = fd;
-    }
-    if (fd >= KBOX_FD_FAST_BASE && fd < KBOX_FD_HOSTONLY_BASE &&
-        (t->next_fast_fd < KBOX_FD_FAST_BASE || fd < t->next_fast_fd)) {
-        t->next_fast_fd = fd;
-    }
-    if (fd >= KBOX_FD_BASE && fd < KBOX_FD_FAST_BASE &&
-        (t->next_fd < KBOX_FD_BASE || fd < t->next_fd)) {
+    if (fd >= 0 && fd < t->next_fd)
         t->next_fd = fd;
-    }
     return old;
 }
 
