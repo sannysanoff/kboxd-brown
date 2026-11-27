@@ -341,6 +341,32 @@ static int nfs_source_is_file(const struct kbox_sysnrs *s, const char *path)
     return (st.st_mode & 0170000u) == 0100000u;
 }
 
+/* Wait until a path created on the export is visible to a lookup.
+ *
+ * mkdir answers success, but the NFS client has not necessarily confirmed the
+ * new entry, so the next lookup of it fails ESTALE or EIO. Binding first and
+ * hoping the container's own access is later is not enough: the container's
+ * FIRST access is the one that fails, which is how ClickHouse's entrypoint
+ * aborted on chown -R and a stack never came up. Poll the lookup here, where a
+ * retry costs nothing and the container never sees the window.
+ */
+static int nfs_wait_visible(const struct kbox_sysnrs *s, const char *path)
+{
+    for (int attempt = 0; attempt < 6; attempt++) {
+        struct kbox_lkl_stat st;
+        if (kbox_lkl_newfstatat(s, AT_FDCWD_LINUX, path, &st, 0) == 0)
+            return 0;
+        if (attempt == 5)
+            break;
+        long ms = kbox_nfs_bind_delay_ms(attempt);
+        struct timespec ts;
+        ts.tv_sec = ms / 1000;
+        ts.tv_nsec = (ms % 1000) * 1000000L;
+        nanosleep(&ts, NULL);
+    }
+    return -1;
+}
+
 /* Bind the subtree a container asked for. Called with the container's mount
  * namespace already unshared and its rootfs mounted via overlayfs, before
  * chroot, so paths are LKL-root paths of the form <rootfs><destination>.
@@ -427,6 +453,11 @@ int kbox_daemon_nfs_bind_container(const struct kbox_sysnrs *s,
                     kbox_lkl_close(s, fd);
             }
         }
+
+        /* Make sure the entry is really visible before binding it: a container
+         * whose first lookup fails dies on it (ClickHouse's chown -R aborts),
+         * and the window is entirely on this side to close. */
+        (void) nfs_wait_visible(s, src);
 
         /* Bind, retrying briefly while a just-created entry is still invisible.
          * mkdir answered success but the client's attribute cache has not
