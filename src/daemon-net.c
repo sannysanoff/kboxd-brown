@@ -215,6 +215,7 @@ int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg)
     cfg->images_hostfs = 1;
     cfg->ephemeral_hostfs = 1;
     cfg->log_dir[0] = '\0';
+    cfg->dns_upstream_count = 0;
     snprintf(cfg->ephemeral_root, sizeof(cfg->ephemeral_root), "%s",
              KBOX_DAEMON_DEFAULT_EPHEMERAL_ROOT);
 
@@ -319,8 +320,7 @@ int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg)
                                  sizeof(cfg->ephemeral_root), "%s", val);
                     else if (strcmp(key, "log_dir") == 0 ||
                              strcmp(key, "log-dir") == 0)
-                        snprintf(cfg->log_dir, sizeof(cfg->log_dir), "%s",
-                                 val);
+                        snprintf(cfg->log_dir, sizeof(cfg->log_dir), "%s", val);
                     continue;
                 }
 
@@ -359,6 +359,10 @@ static pthread_mutex_t g_dns_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct dns_entry g_dns_entries[KBOX_DAEMON_MAX_HOSTS];
 static pthread_t g_dns_thread;
 static int g_dns_started;
+/* Upstream resolvers for the embedded DNS server, copied from the daemon
+ * config at init: the pod's own nameservers, not a hardcoded address. */
+static char g_dns_upstream[KBOX_DNS_UPSTREAM_MAX][32];
+static size_t g_dns_upstream_count;
 
 /* Root-netns worker thread. */
 static pthread_mutex_t g_netns_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -979,11 +983,12 @@ static int dns_lookup_local(const char *qname, uint32_t *ip_be_out)
     return 0;
 }
 
-static int dns_forward_upstream(const struct kbox_sysnrs *sysnrs,
-                                const uint8_t *query,
-                                size_t qlen,
-                                uint8_t *resp,
-                                size_t resp_cap)
+static int dns_forward_one(const struct kbox_sysnrs *sysnrs,
+                           const char *upstream,
+                           const uint8_t *query,
+                           size_t qlen,
+                           uint8_t *resp,
+                           size_t resp_cap)
 {
     long usock =
         kbox_lkl_socket(sysnrs, AF_INET, LKL_SOCK_DGRAM | LKL_SOCK_NONBLOCK, 0);
@@ -994,7 +999,7 @@ static int dns_forward_upstream(const struct kbox_sysnrs *sysnrs,
     memset(&up, 0, sizeof(up));
     up.sin_family = AF_INET;
     up.sin_port = htons(KBOX_DAEMON_DNS_PORT);
-    inet_pton(AF_INET, UPSTREAM_DNS_IP, &up.sin_addr);
+    inet_pton(AF_INET, upstream, &up.sin_addr);
 
     if (kbox_lkl_sendto(sysnrs, usock, query, (long) qlen, 0, &up, sizeof(up)) <
         0) {
@@ -1116,8 +1121,19 @@ static void *dns_server_thread(void *arg)
         }
 
         uint8_t uresp[DNS_BUF_LEN];
-        int urn =
-            dns_forward_upstream(sysnrs, pkt, (size_t) n, uresp, sizeof(uresp));
+        int urn = -1;
+        /* Try each configured upstream in order. A pod's resolv.conf usually
+         * lists the cluster resolver first and a search path behind it, so the
+         * first that answers is the right one. */
+        for (size_t ui = 0; ui < g_dns_upstream_count; ui++) {
+            urn = dns_forward_one(sysnrs, g_dns_upstream[ui], pkt, (size_t) n,
+                                  uresp, sizeof(uresp));
+            if (urn > 0)
+                break;
+        }
+        if (urn <= 0 && g_dns_upstream_count == 0)
+            urn = dns_forward_one(sysnrs, UPSTREAM_DNS_IP, pkt, (size_t) n,
+                                  uresp, sizeof(uresp));
         if (urn > 0) {
             (void) kbox_lkl_sendto(sysnrs, sock, uresp, (long) urn, 0, &cli,
                                    (long) clilen);
@@ -1425,6 +1441,45 @@ void kbox_daemon_port_remove_ip(const char *container_ip)
         pthread_join(to_join[i], NULL);
 }
 
+/* kbox_daemon_read_resolvers fills the config's upstream list from the POD's
+ * /etc/resolv.conf. kboxd runs inside a pod, so that file is the authoritative
+ * list of resolvers this workload is allowed to use — forwarding to anything
+ * else (or to a constant) either leaks past the cluster resolver or, for a
+ * ClusterDNS name, answers NXDOMAIN for a service that exists.
+ */
+void kbox_daemon_read_resolvers(struct kbox_daemon_config *cfg)
+{
+    if (!cfg)
+        return;
+    FILE *f = fopen("/etc/resolv.conf", "re");
+    if (!f)
+        return;
+    char line[256];
+    while (fgets(line, sizeof(line), f) &&
+           cfg->dns_upstream_count < KBOX_DNS_UPSTREAM_MAX) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (strncmp(p, "nameserver", 10) != 0)
+            continue;
+        p += 10;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        char *end = p;
+        while (*end && *end != '\n' && *end != '\r' && *end != ' ' &&
+               *end != '\t')
+            end++;
+        *end = '\0';
+        struct in_addr ina;
+        if (*p && inet_pton(AF_INET, p, &ina) == 1) {
+            snprintf(cfg->dns_upstream[cfg->dns_upstream_count],
+                     sizeof(cfg->dns_upstream[0]), "%s", p);
+            cfg->dns_upstream_count++;
+        }
+    }
+    fclose(f);
+}
+
 int kbox_daemon_net_init(const struct kbox_sysnrs *sysnrs,
                          const struct kbox_daemon_config *cfg,
                          int verbose)
@@ -1432,6 +1487,15 @@ int kbox_daemon_net_init(const struct kbox_sysnrs *sysnrs,
     g_sysnrs = sysnrs;
     g_verbose = verbose;
     __atomic_store_n(&g_running, 1, __ATOMIC_RELEASE);
+
+    if (cfg) {
+        g_dns_upstream_count = cfg->dns_upstream_count;
+        if (g_dns_upstream_count > KBOX_DNS_UPSTREAM_MAX)
+            g_dns_upstream_count = KBOX_DNS_UPSTREAM_MAX;
+        for (size_t i = 0; i < g_dns_upstream_count; i++)
+            snprintf(g_dns_upstream[i], sizeof(g_dns_upstream[i]), "%s",
+                     cfg->dns_upstream[i]);
+    }
 
     const char *start_ip = (cfg && cfg->start_ip[0])
                                ? cfg->start_ip

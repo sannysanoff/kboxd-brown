@@ -3300,6 +3300,11 @@ int kbox_daemon_run(const char *sock_path, const char *cmdline, int verbose)
 
     struct kbox_daemon_config cfg;
     kbox_daemon_load_config(g_config_path, &cfg);
+    /* Nameservers come from the pod, never from a constant: the cluster
+     * resolver address differs per cluster and is what resolves cluster names
+     * (the Nexus, a sibling service) as well as the public internet. */
+    if (cfg.dns_upstream_count == 0)
+        kbox_daemon_read_resolvers(&cfg);
     g_config = cfg;
 
     /* Container logs live here; created after the config is read because the

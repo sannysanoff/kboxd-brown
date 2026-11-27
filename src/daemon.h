@@ -17,6 +17,7 @@
 #define KBOX_DAEMON_HOST_MASK "255.255.255.255"
 #define KBOX_DAEMON_DNS_PORT 53
 #define KBOX_DAEMON_MAX_HOSTS 512
+#define KBOX_DNS_UPSTREAM_MAX 4
 #define KBOX_DAEMON_MAX_ALIAS 128
 #define KBOX_DAEMON_DEFAULT_EPHEMERAL_ROOT "/tmp/.kboxd/ephemeral"
 
@@ -38,6 +39,12 @@ struct kbox_nfs_mount {
 struct kbox_daemon_config {
     char start_ip[32];
     char gateway_ip[32];
+    /* Upstream resolver for the embedded DNS server. Defaults are the pod's own
+     * nameservers (read from /etc/resolv.conf at startup): a hardcoded address
+     * cannot resolve cluster names, because the nameserver differs per cluster
+     * and per pod. */
+    char dns_upstream[KBOX_DNS_UPSTREAM_MAX][32];
+    size_t dns_upstream_count;
     struct kbox_nfs_mount nfs[KBOX_NFS_MAX_MOUNTS];
     size_t nfs_count;
     /* Storage. Defaults are host-backed: image layers and each container's
@@ -62,6 +69,7 @@ struct kbox_daemon_config {
 };
 
 int kbox_daemon_load_config(const char *path, struct kbox_daemon_config *cfg);
+void kbox_daemon_read_resolvers(struct kbox_daemon_config *cfg);
 void kbox_daemon_set_config_path(const char *path);
 int kbox_daemon_main(int argc, char **argv);
 int kbox_daemon_run(const char *sock_path, const char *cmdline, int verbose);
