@@ -25,20 +25,6 @@ struct kbox_sysnrs; /* forward declaration */
 /* One slot per descriptor number; nothing is reserved by position. */
 #define KBOX_FD_TABLE_CAPACITY KBOX_FD_TABLE_MAX
 
-/* Native close boundary [0, KBOX_NATIVE_CLOSE_MAX).
- *
- * Host-kernel descriptors created natively (pipes, pipe2, stdio, host sockets)
- * take the lowest free numbers below this boundary, and the seccomp filter
- * allows close(fd) for fd < KBOX_NATIVE_CLOSE_MAX directly in the host kernel.
- * That avoids the seccomp_unotify pre-NOTIF_RECV signal race (SIGCHLD aborting
- * close() with ERESTARTSYS/EINTR before the supervisor receives it, leaking
- * pipe descriptors in shells). Virtual LKL descriptors auto-allocate from
- * KBOX_NATIVE_CLOSE_MAX upward so their close() always reaches the supervisor;
- * any virtual descriptor explicitly placed below it (via dup2/dup3/F_DUPFD)
- * receives a real host placeholder fd so native close() succeeds with 0.
- */
-#define KBOX_NATIVE_CLOSE_MAX 1024
-
 /* Reverse lookup for host_fd -> virtual fd. Sized to cover the
  * child's RLIMIT_NOFILE (65536). Host FDs at or above this bound
  * fall through to a slow linear scan.

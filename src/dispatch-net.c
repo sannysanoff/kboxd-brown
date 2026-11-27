@@ -168,7 +168,7 @@ static int attach_shadow_socket(const struct kbox_syscall_request *req,
     if (sock_flags & SOCK_NONBLOCK)
         fcntl(sp[1], F_SETFL, O_NONBLOCK);
 
-    long vfd = kbox_fd_table_insert(ctx->fd_table, lkl_fd, 0);
+    long vfd = kbox_alloc_vfd(ctx, lkl_fd, 0);
     if (vfd < 0) {
         close(sp[0]);
         close(sp[1]);
@@ -281,7 +281,7 @@ struct kbox_dispatch forward_socket(const struct kbox_syscall_request *req,
     if (!kbox_net_is_active() ||
         (domain != 2 /* AF_INET */ && domain != 10 /* AF_INET6 */) ||
         (base_type != SOCK_STREAM && base_type != SOCK_DGRAM)) {
-        long vfd = kbox_fd_table_insert(ctx->fd_table, lkl_fd, 0);
+        long vfd = kbox_alloc_vfd(ctx, lkl_fd, 0);
         if (vfd < 0) {
             lkl_close_and_invalidate(ctx, lkl_fd);
             return kbox_dispatch_errno(EMFILE);
@@ -702,7 +702,7 @@ static struct kbox_dispatch complete_accept_result(
      * self-connection, it is not the shadow's existence.
      */
     if (!entry || entry->shadow_sp < 0 || !kbox_net_is_active()) {
-        long vfd = kbox_fd_table_insert(ctx->fd_table, client_lkl, 0);
+        long vfd = kbox_alloc_vfd(ctx, client_lkl, 0);
         if (vfd < 0) {
             lkl_close_and_invalidate(ctx, client_lkl);
             return kbox_dispatch_errno(EMFILE);

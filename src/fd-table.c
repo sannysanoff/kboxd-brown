@@ -211,18 +211,17 @@ void kbox_fd_table_init(struct kbox_fd_table *t)
         t->lkl_fd_refs[i] = 0;
     memset(t->low_host_bitmap, 0, sizeof(t->low_host_bitmap));
     t->low_host_count = 0;
-    t->next_fd = KBOX_NATIVE_CLOSE_MAX;
+    t->next_fd = 0;
 }
 
-/* Auto-allocate a virtual descriptor from [KBOX_NATIVE_CLOSE_MAX,
- * KBOX_FD_TABLE_CAPACITY) so its close() is notified to the supervisor. */
+/* Auto-allocate a virtual descriptor from [0, KBOX_FD_TABLE_CAPACITY). */
 long kbox_fd_table_insert(struct kbox_fd_table *t, long lkl_fd, int mirror_tty)
 {
     long start_fd = t->next_fd;
     long fd;
 
-    if (start_fd < KBOX_NATIVE_CLOSE_MAX || start_fd >= KBOX_FD_TABLE_CAPACITY)
-        start_fd = KBOX_NATIVE_CLOSE_MAX;
+    if (start_fd < 0 || start_fd >= KBOX_FD_TABLE_CAPACITY)
+        start_fd = 0;
 
     for (fd = start_fd; fd < KBOX_FD_TABLE_CAPACITY; fd++) {
         if (t->slots[fd].lkl_fd == -1) {
@@ -233,8 +232,8 @@ long kbox_fd_table_insert(struct kbox_fd_table *t, long lkl_fd, int mirror_tty)
         }
     }
 
-    /* Wrap around: scan from KBOX_NATIVE_CLOSE_MAX up to start_fd. */
-    for (fd = KBOX_NATIVE_CLOSE_MAX; fd < start_fd; fd++) {
+    /* Wrap around: scan from 0 up to start_fd. */
+    for (fd = 0; fd < start_fd; fd++) {
         if (t->slots[fd].lkl_fd == -1) {
             init_live_entry(&t->slots[fd], lkl_fd, mirror_tty);
             lkl_ref_inc(t, lkl_fd);
@@ -247,8 +246,8 @@ long kbox_fd_table_insert(struct kbox_fd_table *t, long lkl_fd, int mirror_tty)
      * shows up here too, so say how full the pool is when it runs out. */
     {
         long live = 0;
-        long cap = KBOX_FD_TABLE_CAPACITY - KBOX_NATIVE_CLOSE_MAX;
-        for (fd = KBOX_NATIVE_CLOSE_MAX; fd < KBOX_FD_TABLE_CAPACITY; fd++)
+        long cap = KBOX_FD_TABLE_CAPACITY;
+        for (fd = 0; fd < KBOX_FD_TABLE_CAPACITY; fd++)
             if (t->slots[fd].lkl_fd != -1)
                 live++;
         fprintf(stderr, "kbox: virtual fd table full (%ld live of %ld)\n", live,

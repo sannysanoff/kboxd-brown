@@ -9,7 +9,7 @@ static void test_fd_table_init_zeros(void)
 {
     static struct kbox_fd_table t;
     kbox_fd_table_init(&t);
-    ASSERT_EQ(t.next_fd, KBOX_NATIVE_CLOSE_MAX);
+    ASSERT_EQ(t.next_fd, 0);
     for (int i = 0; i < KBOX_FD_TABLE_CAPACITY; i++) {
         ASSERT_EQ(t.slots[i].lkl_fd, -1);
         ASSERT_EQ(t.slots[i].flags, KBOX_FD_FLAG_NONE);
@@ -21,7 +21,7 @@ static void test_fd_table_insert_basic(void)
     static struct kbox_fd_table t;
     kbox_fd_table_init(&t);
     long vfd = kbox_fd_table_insert(&t, 42, 0);
-    ASSERT_EQ(vfd, KBOX_NATIVE_CLOSE_MAX);
+    ASSERT_EQ(vfd, 0);
     ASSERT_EQ(kbox_fd_table_get_lkl(&t, vfd), 42);
 }
 
@@ -32,9 +32,9 @@ static void test_fd_table_insert_sequential(void)
     long vfd1 = kbox_fd_table_insert(&t, 10, 0);
     long vfd2 = kbox_fd_table_insert(&t, 20, 0);
     long vfd3 = kbox_fd_table_insert(&t, 30, 0);
-    ASSERT_EQ(vfd1, KBOX_NATIVE_CLOSE_MAX);
-    ASSERT_EQ(vfd2, KBOX_NATIVE_CLOSE_MAX + 1);
-    ASSERT_EQ(vfd3, KBOX_NATIVE_CLOSE_MAX + 2);
+    ASSERT_EQ(vfd1, 0);
+    ASSERT_EQ(vfd2, 1);
+    ASSERT_EQ(vfd3, 2);
     ASSERT_EQ(kbox_fd_table_get_lkl(&t, vfd1), 10);
     ASSERT_EQ(kbox_fd_table_get_lkl(&t, vfd2), 20);
     ASSERT_EQ(kbox_fd_table_get_lkl(&t, vfd3), 30);

@@ -399,6 +399,9 @@ void translate_proc_self(const char *path,
 /* FD utilities. */
 
 int child_fd_is_open(const struct kbox_supervisor_ctx *ctx, long fd);
+long kbox_alloc_vfd(struct kbox_supervisor_ctx *ctx,
+                    long lkl_fd,
+                    int mirror_tty);
 int ensure_proc_self_fd_dir(struct kbox_supervisor_ctx *ctx);
 int ensure_proc_mem_fd(struct kbox_supervisor_ctx *ctx);
 
