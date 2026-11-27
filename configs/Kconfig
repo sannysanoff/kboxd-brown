@@ -32,13 +32,20 @@ menu "Syscall Interception"
 
 config SYSCALL_FAST_PATH
     bool "AUTO mode uses rewrite/trap fast-path"
-    default y
+    default n
     help
       When enabled, AUTO mode selects binary rewriting (Tier 2) or
       SIGSYS trap (Tier 1) for non-shell, non-networking binaries
       on both x86_64 and aarch64.
 
-      Typical speedups (release build, vs seccomp baseline):
+      Off by default. Rewrite is only ~18% faster than seccomp on
+      stat-heavy work and slower on cheap read/write, because the
+      per-call cost is the notification (27us) rather than the
+      dispatch, and filesystem emulation dominates anything that
+      touches LKL. Seccomp is also the only mode where parent and
+      child share one LKL instance, so it is the safe default.
+
+      Measured speedups (release build, own stand, aarch64):
         aarch64: stat 8x faster, open+close 1.4x faster
         x86_64:  open+close 1.3x faster, lseek+read 1.7x faster
 
@@ -47,7 +54,7 @@ config SYSCALL_FAST_PATH
       cannot track.  Sanitizer builds use seccomp for correctness
       testing; release builds get the full fast-path.
 
-      If unsure, say Y.
+      Turn this on only for a workload measured to benefit.
 
 config STAT_CACHE_SIZE
     int "FD-local stat cache entries"
