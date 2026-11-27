@@ -1986,13 +1986,39 @@ class DockerEngineState:
         t.start()
 
     def copy_into(self, c, dest_dir, blob):
-        """Unpack a tar into a path inside a running container.
+        """Unpack a tar into a path inside a container.
 
-        Docker reaches into a container's rootfs directly; we cannot, because
-        that rootfs lives in the LKL guest. So the archive is streamed to a tar
-        process *inside* the container through a FIFO that exec_start opens as
-        its stdin — the same channel `docker exec -i` uses.
+        The container's rootfs lives in the LKL guest, so the archive cannot be
+        written from here. Two cases, because Docker allows both:
+          - running container: stream it into a tar over the FIFO-backed stdin
+            that `docker exec -i` already uses;
+          - created, not yet started: hand it to the daemon, which has no rootfs
+            to write into yet (the overlay is built at start) and applies it
+            right after that.
+        Buildx takes the second path to install its buildkitd config, so this
+        is what makes `docker build` possible at all.
         """
+        self.refresh_container(c)
+        if c["status"] != "running":
+            # The daemon reads the archive from a file: it and this shim share
+            # one filesystem, and the RPC is line-delimited JSON.
+            tmp = os.path.join(self.state_dir, "cp-" + secrets.token_hex(8) + ".tar")
+            with open(tmp, "wb") as fh:
+                fh.write(blob)
+            try:
+                self.rpc.call({
+                    "op": "container_put_archive",
+                    "id": c["id"],
+                    "dest": dest_dir,
+                    "path": tmp,
+                })
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            return None
+
         fifo = os.path.join(self.state_dir, "cp-" + secrets.token_hex(8))
         try:
             os.unlink(fifo)

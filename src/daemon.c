@@ -104,6 +104,84 @@ struct daemon_proc_env {
     long mem_limit; /* bytes, 0 = none */
 };
 
+/* Unpack a tar blob into <rootfs><dest>.
+ * `docker cp` into a container that is still "created" is how buildx installs
+ * its buildkitd config, and a created container has no rootfs yet: the overlay
+ * is assembled at start. Those archives are stored on the container and applied
+ * here, right after the overlay exists and before any process runs.
+ */
+static int untar_into_rootfs(const struct kbox_sysnrs *s,
+                             const char *rootfs,
+                             const char *blob,
+                             size_t len)
+{
+    size_t off = 0;
+    int files = 0;
+
+    while (off + 512 <= len) {
+        const char *hdr = blob + off;
+        char name[256];
+        char dest[KBOX_MAX_PATH];
+        long size = 0;
+        char type;
+
+        if (hdr[0] == '\0')
+            break; /* end-of-archive marker */
+
+        snprintf(name, sizeof(name), "%.*s", 100, hdr);
+        type = hdr[156];
+        for (int i = 124; i < 136 && hdr[i] >= '0' && hdr[i] <= '7'; i++)
+            size = size * 8 + (hdr[i] - '0');
+
+        off += 512;
+        if (off + (size_t) size > len)
+            break;
+
+        if (strstr(name, ".."))
+            goto skip;
+
+        while (name[0] == '.' && name[1] == '/')
+            memmove(name, name + 2, strlen(name) + 1);
+        while (name[0] == '/')
+            memmove(name, name + 1, strlen(name) + 1);
+        if (!name[0])
+            goto skip;
+        if ((size_t) snprintf(dest, sizeof(dest), "%s/%s", rootfs, name) >=
+            sizeof(dest))
+            goto skip;
+
+        if (type == '5') {
+            lkl_mkdir_p_daemon(s, dest, 0755);
+        } else if (type == '0' || type == '\0') {
+            long fd =
+                kbox_lkl_openat(s, AT_FDCWD_LINUX, dest,
+                                0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
+            if (fd >= 0) {
+                size_t left = (size_t) size;
+                const char *p = blob + off;
+                while (left > 0) {
+                    long w = kbox_lkl_write(s, fd, p, left);
+                    if (w <= 0)
+                        break;
+                    p += w;
+                    left -= (size_t) w;
+                }
+                kbox_lkl_close(s, fd);
+                files++;
+            }
+        } else if (type == '2') {
+            char link[256];
+            snprintf(link, sizeof(link), "%.*s", 100, hdr + 157);
+            if (link[0])
+                (void) kbox_lkl_symlinkat(s, link, AT_FDCWD_LINUX, dest);
+        }
+
+    skip:
+        off += ((size_t) size + 511) & ~(size_t) 511;
+    }
+    return files;
+}
+
 struct daemon_container {
     int slot;
     enum container_state state;
@@ -134,6 +212,14 @@ struct daemon_container {
     int uts_ns_fd;
     int rootfs_dir_fd;
     int active_execs;
+
+    /* Files a caller deposited before the rootfs existed. The overlay is
+     * created at start, so `docker cp` into a created-but-not-started container
+     * (which is how buildx installs its buildkitd config) has nowhere to write;
+     * the archive is unpacked into the rootfs once it is built. */
+    char *pending_blob;
+    size_t pending_blob_len;
+    char pending_dest[PATH_MAX];
 
     pid_t child_pid;
     int exit_efd;
@@ -1555,6 +1641,7 @@ stdin_ok:
     ctx.fd_table = &fd_table;
     ctx.listener_fd = listener_fd;
     ctx.proc_self_fd_dirfd = -1;
+    ctx.close_inotify_fd = -1;
     ctx.proc_mem_fd = -1;
     ctx.child_pid = pid;
     ctx.verbose = g_verbose;
@@ -1843,6 +1930,25 @@ static void *container_worker_thread(void *arg)
             return NULL;
         }
         free(cbuf);
+    }
+
+    /* Apply an archive deposited before the rootfs existed (docker cp into a
+     * created container, which is how buildx installs its buildkitd config).
+     * Done here: the overlay is up, and nothing has run in it yet. */
+    if (c->pending_blob && c->pending_dest[0]) {
+        char base[PATH_MAX];
+        char dest_rel[PATH_MAX];
+        snprintf(dest_rel, sizeof(dest_rel), "%s", c->pending_dest);
+        snprintf(base, sizeof(base), "%s", dest_rel);
+        lkl_mkdir_p_daemon(sysnrs, base, 0755);
+        if (g_verbose)
+            fprintf(stderr, "kboxd: applying %zu-byte archive at %s\n",
+                    c->pending_blob_len, dest_rel);
+        (void) untar_into_rootfs(sysnrs, rootfs, c->pending_blob,
+                                 c->pending_blob_len);
+        free(c->pending_blob);
+        c->pending_blob = NULL;
+        c->pending_blob_len = 0;
     }
 
     /* A private procfs: with /proc continued to the host kernel, everything
@@ -2762,6 +2868,57 @@ static void handle_rpc_line(int client_fd, const char *req)
     pthread_mutex_unlock(&g_cont_table_lock);
     if (!c) {
         send_rpc_err(client_fd, "no such container");
+        return;
+    }
+
+    if (strcmp(op, "container_put_archive") == 0) {
+        char dest[PATH_MAX];
+        char tar_path[PATH_MAX];
+        FILE *f;
+        long sz;
+        char *blob;
+
+        if (kbox_json_get_str(req, "dest", dest, sizeof(dest)) < 0 ||
+            dest[0] != '/') {
+            send_rpc_err(client_fd, "dest required (absolute)");
+            return;
+        }
+        if (kbox_json_get_str(req, "path", tar_path, sizeof(tar_path)) < 0 ||
+            tar_path[0] != '/') {
+            send_rpc_err(client_fd, "path required (absolute)");
+            return;
+        }
+        /* The shim and the daemon share a filesystem, so the archive comes in
+         * as a file rather than inline: the RPC is line-delimited JSON, and
+         * carrying a tar inside one would need an encoding and a size cap. */
+        f = fopen(tar_path, "re");
+        if (!f) {
+            send_rpc_err(client_fd, "cannot open archive");
+            return;
+        }
+        if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0 ||
+            fseek(f, 0, SEEK_SET) != 0) {
+            fclose(f);
+            send_rpc_err(client_fd, "cannot size archive");
+            return;
+        }
+        blob = malloc((size_t) sz);
+        if (!blob || fread(blob, 1, (size_t) sz, f) != (size_t) sz) {
+            free(blob);
+            fclose(f);
+            send_rpc_err(client_fd, "cannot read archive");
+            return;
+        }
+        fclose(f);
+        unlink(tar_path);
+
+        pthread_mutex_lock(&c->lock);
+        free(c->pending_blob);
+        c->pending_blob = blob;
+        c->pending_blob_len = (size_t) sz;
+        snprintf(c->pending_dest, sizeof(c->pending_dest), "%s", dest);
+        pthread_mutex_unlock(&c->lock);
+        send_rpc_line(client_fd, "{\"ok\":true}\n");
         return;
     }
 
