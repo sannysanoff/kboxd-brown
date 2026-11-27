@@ -89,9 +89,13 @@ extern char **environ;
  *
  * When KBOX_AUTO_FAST_PATH is set (via Kconfig SYSCALL_FAST_PATH=y), AUTO
  * mode selects rewrite/trap for non-shell, non-networking binaries on
- * both x86_64 and aarch64.  The guest-thread local fast-path handles 50+
- * CONTINUE syscalls without service-thread IPC, giving trap/rewrite mode
- * a throughput advantage for workloads heavy on futex/brk/epoll/mmap.
+ * both x86_64 and aarch64.
+ *
+ * Default is off: seccomp is the safe mode. It is the only mode where the
+ * parent and every child share one LKL instance, and the fast path only wins
+ * where filesystem emulation does not dominate (rewrite measured ~18% faster
+ * on stat, slower on cheap read/write, since the per-call cost is the
+ * notification rather than the dispatch).
  *
  * Users can override with --syscall-mode=rewrite or --syscall-mode=trap.
  */
@@ -736,7 +740,11 @@ static int run_rewrite_launch(const struct kbox_image_args *args,
     struct kbox_fd_table *fd_table;
     struct kbox_supervisor_ctx *ctx;
     struct kbox_syscall_trap_runtime trap_runtime;
-    struct kbox_rewrite_runtime rewrite_runtime;
+    /* The install stores this address in a global that outlives the call, and
+     * transfer_to_guest then abandons this stack frame: a local here leaves the
+     * global pointing at dead stack, which segfaults on the guest's first
+     * syscall. Same reason dispatch-exec.c keeps its runtime static. */
+    static struct kbox_rewrite_runtime rewrite_runtime;
     size_t range_count;
 
     if (!host_nrs || !launch)
