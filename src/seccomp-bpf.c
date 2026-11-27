@@ -553,6 +553,16 @@ static int install_seccomp_filter(
     EMIT_ALLOW(h->rt_sigreturn);
 #undef EMIT_ALLOW
 
+    /* EXPERIMENT (off by default): every fd-based call goes through the
+     * notification, so the supervisor decides by its own table instead of the
+     * filter deciding by the descriptor's range. Measured on the same stand as
+     * the stock filter: the dup'd-directory close that fails on stock passes,
+     * pipe-eintr (3000 rounds) and pipe-churn (1500 rounds x 1200 forks) lose
+     * nothing on either build, and the full guest suite is identical (53 pass,
+     * 5 fail, same 5). The cost is +3% on a command-substitution loop
+     * (42.7s -> 43.9s per 1000 rounds). Enable with
+     * -DKBOX_EXPERIMENT_NOTIFY_ALL_FDS to re-measure. */
+#ifndef KBOX_EXPERIMENT_NOTIFY_ALL_FDS
     emit_fast_shadow_allow(filter, &idx, h->read);
     emit_fast_shadow_allow(filter, &idx, h->pread64);
     emit_fast_shadow_allow(filter, &idx, h->write);
@@ -571,6 +581,7 @@ static int install_seccomp_filter(
      * accumulator has to be reloaded before the next syscall-number compare. */
     filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
         KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS, KBOX_SECCOMP_DATA_NR_OFFSET);
+#endif
 
     /* pipe() and pipe2() run in the kernel.
      *
@@ -757,8 +768,11 @@ static int install_seccomp_filter(
     ret = syscall(__NR_seccomp, KBOX_SECCOMP_SET_MODE_FILTER, filter_flags,
                   &prog);
     if (ret < 0) {
+        int saved = errno;
+
         fprintf(stderr, "kbox: seccomp(SET_MODE_FILTER, 0x%x) failed: %s\n",
-                filter_flags, strerror(errno));
+                filter_flags, strerror(saved));
+        errno = saved;
         return -1;
     }
 
@@ -775,11 +789,21 @@ int kbox_install_seccomp_listener(const struct kbox_host_nrs *h)
 
     /* Older kernels reject the flag with EINVAL; a kernel without seccomp user
      * notifications answers ENOSYS. Retry with the plain listener so the host
-     * still runs, with the pre-6.4 semantics. */
-    if (fd < 0 && (errno == EINVAL || errno == ENOSYS))
+     * still runs, with the pre-6.4 semantics. The downgrade is announced
+     * BEFORE the retry: once the fallback filter is installed this process is
+     * under its own notification, and a write() here would wait for a
+     * supervisor that has not been handed the listener yet. */
+    if (fd < 0 && (errno == EINVAL || errno == ENOSYS)) {
+        int saved = errno;
+
+        fprintf(stderr,
+                "kbox: WAIT_KILLABLE_RECV refused (%s): notifications are "
+                "interruptible by signals, expect spurious EINTR\n",
+                strerror(saved));
         fd = install_seccomp_filter(h, KBOX_SECCOMP_RET_USER_NOTIF,
                                     KBOX_SECCOMP_FILTER_FLAG_NEW_LISTENER, NULL,
                                     0);
+    }
     return fd;
 }
 
