@@ -50,9 +50,9 @@ static void test_request_init_from_regs_preserves_custom_guest_mem(void)
     };
 
     ASSERT_EQ(kbox_syscall_request_init_from_regs(
-                  &req, KBOX_SYSCALL_SOURCE_TRAP, 77, 0, &regs, &guest_mem),
+                  &req, KBOX_SYSCALL_SOURCE_SECCOMP, 77, 0, &regs, &guest_mem),
               0);
-    ASSERT_EQ(req.source, KBOX_SYSCALL_SOURCE_TRAP);
+    ASSERT_EQ(req.source, KBOX_SYSCALL_SOURCE_SECCOMP);
     ASSERT_EQ(req.pid, 77);
     ASSERT_EQ(req.nr, 172);
     ASSERT_EQ(req.instruction_pointer, 0x8040);
