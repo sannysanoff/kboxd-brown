@@ -85,10 +85,11 @@ ROOTFS       = alpine.ext4
 
 check: check-unit check-integration check-stress check-hostfs
 
-check-unit: $(TEST_TARGET)
+check-unit: $(TEST_TARGET) $(NOVFORK_SO)
 	@echo "  RUN     check-unit"
 	$(Q)./$(TEST_TARGET)
 	$(Q)python3 $(TEST_DIR)/test-docker-engine.py
+	$(Q)python3 $(TEST_DIR)/test-novfork-shim.py
 
 # Unit tests are built WITHOUT linking LKL.
 # We define LKL stubs for functions referenced by test support code.

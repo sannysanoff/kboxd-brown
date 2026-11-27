@@ -4,6 +4,7 @@
 __pycache__
 *.ext4
 /kbox
+/kbox-novfork.so
 tests/unit/test-runner
 deps/
 lkl-x86_64/

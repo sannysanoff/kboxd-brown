@@ -47,10 +47,23 @@ include mk/format.mk
 # Top-level targets
 .PHONY: all clean distclean config defconfig oldconfig savedefconfig install-hooks
 
-all: $(TARGET)
+# kbox-novfork.so: the vfork shim a guest is started with.
+#
+# The engine rewrites an exec pathname in the tracee's memory, which is shared
+# with a CLONE_VM|CLONE_VFORK parent; clone3 can have its flags rewritten but
+# clone() and vfork() pass them in a register, so those callers keep the shared
+# address space and the restore path is not exhaustive. Shipping the shim from
+# here keeps it beside the engine that needs it instead of in each consumer.
+NOVFORK_SO := kbox-novfork.so
+
+all: $(TARGET) $(NOVFORK_SO)
 ifneq ($(wildcard .git/hooks),)
 all: | .git/hooks/pre-commit
 endif
+
+$(NOVFORK_SO): support/kbox-novfork.c
+	@echo "  CC      $@"
+	$(Q)$(CC) -shared -fPIC -O2 -o $@ $<
 
 $(TARGET): $(OBJS) $(LKL_LIB)
 	@echo "  LD      $@"
