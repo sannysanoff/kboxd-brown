@@ -1985,6 +1985,46 @@ class DockerEngineState:
         t = threading.Thread(target=self._watch_exit, args=(c, gen), daemon=True)
         t.start()
 
+    def copy_into(self, c, dest_dir, blob):
+        """Unpack a tar into a path inside a running container.
+
+        Docker reaches into a container's rootfs directly; we cannot, because
+        that rootfs lives in the LKL guest. So the archive is streamed to a tar
+        process *inside* the container through a FIFO that exec_start opens as
+        its stdin — the same channel `docker exec -i` uses.
+        """
+        fifo = os.path.join(self.state_dir, "cp-" + secrets.token_hex(8))
+        try:
+            os.unlink(fifo)
+        except OSError:
+            pass
+        os.mkfifo(fifo)
+
+        rec = self.create_exec(c, {
+            "Cmd": ["/bin/sh", "-c",
+                    'cd "$1" && tar -xf -', "sh", dest_dir],
+            "AttachStdin": True,
+            "AttachStdout": True,
+            "AttachStderr": True,
+        })
+        rec["stdin_path"] = fifo
+        self.start_exec(rec)
+
+        def feed():
+            try:
+                with open(fifo, "wb") as w:
+                    w.write(blob)
+            except Exception as exc:
+                print(f"[dockerd] copy_into feed failed: {exc}", file=sys.stderr)
+            finally:
+                try:
+                    os.unlink(fifo)
+                except OSError:
+                    pass
+
+        threading.Thread(target=feed, daemon=True).start()
+        return rec
+
     def create_exec(self, c, body):
         self.refresh_container(c)
         if c["status"] != "running":
@@ -2783,6 +2823,34 @@ class DockerHandler(BaseHTTPRequestHandler):
             return
 
         self.send_json(404, {"message": f"unsupported POST {path}"})
+
+    def do_PUT(self):
+        eng = self.server.engine
+        path, qs = self._parse_url()
+
+        # PUT /containers/{id}/archive?path=DIR — `docker cp` into a container,
+        # the only way to hand a running container a file. Buildx uses it to
+        # install its buildkitd config, so a build cannot start without it.
+        m = re.match(r"^/containers/([^/]+)/archive$", path)
+        if m:
+            c = eng.find_container(urllib.parse.unquote(m.group(1)))
+            if not c:
+                self.send_json(404, {"message": "No such container"})
+                return
+            dest = (qs.get("path") or ["/"])[0] or "/"
+            body = self._read_body()
+            if not body:
+                self.send_json(400, {"message": "empty archive"})
+                return
+            try:
+                eng.copy_into(c, dest, body)
+            except Exception as exc:
+                self.send_json(500, {"message": str(exc)})
+                return
+            self.send_empty(200)
+            return
+
+        self.send_json(404, {"message": "not found"})
 
     def do_DELETE(self):
         eng = self.server.engine
