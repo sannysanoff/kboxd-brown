@@ -39,7 +39,7 @@ source scripts/gdb/kbox-gdb.py
 ```
 
 Commands:
-- `kbox-fdtable` -- print the virtual FD table (low_fds + high entries)
+- `kbox-fdtable` -- print the virtual FD table entries
 - `kbox-break-syscall NR` -- break when syscall number NR is dispatched
 - `kbox-ctx` -- print supervisor context (listener_fd, child_pid, etc.)
 - `kbox-syscall-trace` -- trace seccomp dispatch -> LKL syscall path
@@ -101,16 +101,16 @@ Break inside a dispatch function:
 (gdb) kbox-fdtable
 ```
 
-Output shows both low FD redirects (dup2 targets, FDs 0-1023) and
-high range entries (>= 32768), including host shadow FDs:
+Output shows all occupied slots in the flat FD table, including host
+shadow FDs:
 
 ```
-FD Table (next_fd=32770):
+FD Table (next_fd=5):
      VFD    LKL_FD   HOST_FD   TTY  CLOEXEC
 -------------------------------------------
        1         3        -1     0        0
-   32768         0        14     0        0
-   32769         1        -1     1        0
+       3         0        14     0        0
+       4         1        -1     1        0
 ```
 
 ### 3. Examine LKL kernel memory
@@ -186,8 +186,9 @@ ksoftirqd, kworkers, jbd2, ext4 journal threads.
   host_fd. Use `kbox-fdtable` to see the mapping.
 - Pipes use host kernel pipes via SECCOMP_IOCTL_NOTIF_ADDFD. No
   LKL involvement. They do NOT appear in the virtual FD table.
-- Low FD redirects (dup2 to FDs 0-1023) are tracked in low_fds[].
-  These are populated by dup2/dup3 for shell I/O redirections.
+- All descriptor numbers share one flat `slots[]` table indexed by
+  descriptor number; redirects from `dup2`/`dup3` occupy their target
+  slot directly.
 
 ## Fork Mode
 

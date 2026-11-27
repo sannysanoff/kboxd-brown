@@ -103,37 +103,31 @@ static void test_fd_table_out_of_range(void)
     ASSERT_EQ(kbox_fd_table_get_lkl(&t, KBOX_FD_TABLE_CAPACITY), -1);
 }
 
-static void test_fd_table_insert_at_low_range(void)
+static void test_fd_table_insert_at_arbitrary(void)
 {
     static struct kbox_fd_table t;
     kbox_fd_table_init(&t);
 
-    /* Boundary: FD 0 (stdin redirect via dup2) */
+    /* Stdin redirect via dup2 */
     int rc = kbox_fd_table_insert_at(&t, 0, 10, 0);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(kbox_fd_table_get_lkl(&t, 0), 10);
 
-    /* Mid-range: FD 100 */
+    /* Arbitrary descriptor numbers are ordinary slots. */
     rc = kbox_fd_table_insert_at(&t, 100, 55, 0);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(kbox_fd_table_get_lkl(&t, 100), 55);
 
-    /* Arbitrary numbers are ordinary slots now. */
-    rc = kbox_fd_table_insert_at(&t, 1023, 77, 1);
+    rc = kbox_fd_table_insert_at(&t, 2000, 77, 1);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(kbox_fd_table_get_lkl(&t, 1023), 77);
-    ASSERT_TRUE(kbox_fd_table_mirror_tty(&t, 1023));
+    ASSERT_EQ(kbox_fd_table_get_lkl(&t, 2000), 77);
+    ASSERT_TRUE(kbox_fd_table_mirror_tty(&t, 2000));
 
-    rc = kbox_fd_table_insert_at(&t, 1024, 66, 0);
-    ASSERT_EQ(rc, 0);
-    ASSERT_EQ(kbox_fd_table_get_lkl(&t, 1024), 66);
-
-    /* Low-range remove */
+    /* Remove and reverse-map host_fd operations */
     long old = kbox_fd_table_remove(&t, 100);
     ASSERT_EQ(old, 55);
     ASSERT_EQ(kbox_fd_table_get_lkl(&t, 100), -1);
 
-    /* Low-range host_fd operations */
     kbox_fd_table_set_host_fd(&t, 0, 42);
     ASSERT_EQ(kbox_fd_table_get_host_fd(&t, 0), 42);
     ASSERT_EQ(kbox_fd_table_find_by_host_fd(&t, 42), 0);
@@ -416,7 +410,7 @@ void test_fd_table_init(void)
     TEST_REGISTER(test_fd_table_mirror_tty);
     TEST_REGISTER(test_fd_table_cloexec);
     TEST_REGISTER(test_fd_table_out_of_range);
-    TEST_REGISTER(test_fd_table_insert_at_low_range);
+    TEST_REGISTER(test_fd_table_insert_at_arbitrary);
     TEST_REGISTER(test_fd_table_overwrite_at);
     TEST_REGISTER(test_fd_table_host_fd_init);
     TEST_REGISTER(test_fd_table_host_fd_default);

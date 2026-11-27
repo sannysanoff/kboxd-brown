@@ -58,13 +58,13 @@ directly in the BPF filter before reaching the supervisor.
 
 ### Virtual FD table (`fd-table.c`)
 
-Maintains a mapping from guest FD numbers to LKL-internal FDs. Three
-ranges back the table: low FDs (0..1023) populated by dup2/dup3 and
-stdio-compatible redirection, mid FDs (1024..32767) for tracked
-host-passthrough descriptors, and high FDs (32768..36863) for normal
-LKL allocation, capped at `KBOX_FD_TABLE_MAX=4096` entries. This split
-avoids collisions between host-kernel FDs (pipes, inherited
-descriptors, eventfds) and LKL-managed FDs.
+Maintains a flat mapping from guest descriptor numbers (`0..65535`,
+`KBOX_FD_TABLE_MAX=65536`) to LKL-internal or host-managed descriptors.
+No descriptor range or band is reserved by number: ownership comes from
+the table itself, allocation hands out the lowest free slot not already
+open in the tracee, and every virtual descriptor is backed by a host
+`memfd` watched via `inotify` so native `close()` in the host kernel
+triggers LKL cleanup when the last guest reference drops.
 
 ### Shadow FDs (`shadow-fd.c`, `dispatch-misc.c`)
 

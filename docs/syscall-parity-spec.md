@@ -10,7 +10,7 @@ interception tiers (seccomp-unotify, SIGSYS trap, binary rewriting).
 
 ## Notation
 
-- `vfd`: virtual file descriptor (32768+), mapped to LKL-internal fd
+- `vfd`: virtual file descriptor, mapped to an LKL-internal fd in the flat FD table
 - `LKL(...)`: forwarded to LKL via lkl_syscall6()
 - `CONTINUE`: host kernel handles (seccomp: FLAG_CONTINUE; trap: re-issue via asm trampoline)
 - `RETURN(val)`: injected return value
