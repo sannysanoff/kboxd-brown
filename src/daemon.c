@@ -30,6 +30,7 @@
 
 #include "daemon.h"
 #include "fd-table.h"
+#include "kbox/daemon-json.h"
 #include "kbox/elf.h"
 #include "kbox/mount.h"
 #include "lkl-wrap.h"
@@ -469,252 +470,6 @@ static const struct kbox_host_nrs *select_host_nrs_for_daemon(void)
 }
 
 /* Minimal, safe JSON helpers (no strcpy/strcat/sprintf/atoi/sscanf). */
-
-static const char *skip_ws(const char *p)
-{
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
-        p++;
-    return p;
-}
-
-static const char *parse_json_string(const char *p, char *out, size_t cap)
-{
-    if (*p != '"')
-        return NULL;
-    p++;
-    size_t pos = 0;
-    while (*p && *p != '"') {
-        unsigned char c = (unsigned char) *p++;
-        if (c == '\\') {
-            unsigned char esc = (unsigned char) *p;
-            if (!esc)
-                return NULL;
-            p++;
-            switch (esc) {
-            case '"':
-            case '\\':
-            case '/':
-                c = esc;
-                break;
-            case 'n':
-                c = '\n';
-                break;
-            case 'r':
-                c = '\r';
-                break;
-            case 't':
-                c = '\t';
-                break;
-            case 'u': {
-                unsigned int code = 0;
-                for (int i = 0; i < 4 && p[i]; i++) {
-                    char h = p[i];
-                    code <<= 4;
-                    if (h >= '0' && h <= '9')
-                        code |= (unsigned int) (h - '0');
-                    else if (h >= 'a' && h <= 'f')
-                        code |= (unsigned int) (h - 'a' + 10);
-                    else if (h >= 'A' && h <= 'F')
-                        code |= (unsigned int) (h - 'A' + 10);
-                }
-                if (strlen(p) >= 4)
-                    p += 4;
-                c = (unsigned char) (code & 0xff);
-                break;
-            }
-            default:
-                c = esc;
-                break;
-            }
-        }
-        if (out && pos + 1 < cap)
-            out[pos++] = (char) c;
-    }
-    if (*p != '"')
-        return NULL;
-    if (out && cap > 0)
-        out[pos] = '\0';
-    return p + 1;
-}
-
-static const char *skip_json_value(const char *p)
-{
-    p = skip_ws(p);
-    if (*p == '"')
-        return parse_json_string(p, NULL, 0);
-    if (*p == '{' || *p == '[') {
-        char open = *p;
-        char close_ch = (open == '{') ? '}' : ']';
-        int depth = 1;
-        p++;
-        while (*p && depth > 0) {
-            if (*p == '"') {
-                p = parse_json_string(p, NULL, 0);
-                if (!p)
-                    return NULL;
-                continue;
-            }
-            if (*p == open)
-                depth++;
-            else if (*p == close_ch)
-                depth--;
-            p++;
-        }
-        return depth == 0 ? p : NULL;
-    }
-    while (*p && *p != ',' && *p != '}' && *p != ']' &&
-           !isspace((unsigned char) *p))
-        p++;
-    return p;
-}
-
-static const char *find_json_field(const char *json, const char *key)
-{
-    const char *p = skip_ws(json);
-    if (*p != '{')
-        return NULL;
-    p = skip_ws(p + 1);
-
-    char kbuf[128];
-    while (*p && *p != '}') {
-        if (*p == ',') {
-            p = skip_ws(p + 1);
-            continue;
-        }
-        const char *next = parse_json_string(p, kbuf, sizeof(kbuf));
-        if (!next)
-            return NULL;
-        p = skip_ws(next);
-        if (*p != ':')
-            return NULL;
-        p = skip_ws(p + 1);
-        if (strcmp(kbuf, key) == 0)
-            return p;
-        p = skip_json_value(p);
-        if (!p)
-            return NULL;
-        p = skip_ws(p);
-    }
-    return NULL;
-}
-
-static int json_get_str(const char *json,
-                        const char *key,
-                        char *out,
-                        size_t cap)
-{
-    const char *v = find_json_field(json, key);
-    if (!v || *v != '"')
-        return -1;
-    return parse_json_string(v, out, cap) ? 0 : -1;
-}
-
-static int json_get_int(const char *json, const char *key, long *out)
-{
-    const char *v = find_json_field(json, key);
-    if (!v)
-        return -1;
-    char *endp = NULL;
-    errno = 0;
-    long val = strtol(v, &endp, 10);
-    if (errno || endp == v)
-        return -1;
-    *out = val;
-    return 0;
-}
-
-static int json_get_bool(const char *json, const char *key, int def)
-{
-    const char *v = find_json_field(json, key);
-    if (!v)
-        return def;
-    if (strncmp(v, "true", 4) == 0)
-        return 1;
-    if (strncmp(v, "false", 5) == 0)
-        return 0;
-    return def;
-}
-
-static int json_get_str_array(const char *json,
-                              const char *key,
-                              char **out,
-                              int max_items)
-{
-    const char *v = find_json_field(json, key);
-    if (!v || *v != '[')
-        return 0;
-    const char *p = skip_ws(v + 1);
-    int count = 0;
-
-    while (*p && *p != ']' && count < max_items) {
-        if (*p == ',') {
-            p = skip_ws(p + 1);
-            continue;
-        }
-        /* Size the buffer to the literal rather than a fixed page: an argv
-         * entry is not bounded by 4096 and a short cap silently truncates it.
-         */
-        const char *q = p;
-        size_t need = 0;
-        if (*q == '"') {
-            q++;
-            while (*q && *q != '"') {
-                if (*q == '\\' && q[1])
-                    q++;
-                q++;
-                need++;
-            }
-        }
-        char *tmp = malloc(need + 1);
-        if (!tmp)
-            break;
-        const char *next = parse_json_string(p, tmp, need + 1);
-        if (!next) {
-            free(tmp);
-            break;
-        }
-        out[count] = tmp;
-        if (out[count])
-            count++;
-        else
-            free(tmp);
-        p = skip_ws(next);
-    }
-    return count;
-}
-
-static size_t json_escape_append(char *dst,
-                                 size_t cap,
-                                 size_t pos,
-                                 const char *s)
-{
-    for (const unsigned char *p = (const unsigned char *) s; *p; p++) {
-        if (pos + 8 >= cap)
-            break;
-        if (*p == '"' || *p == '\\') {
-            dst[pos++] = '\\';
-            dst[pos++] = (char) *p;
-        } else if (*p == '\n') {
-            dst[pos++] = '\\';
-            dst[pos++] = 'n';
-        } else if (*p == '\r') {
-            dst[pos++] = '\\';
-            dst[pos++] = 'r';
-        } else if (*p == '\t') {
-            dst[pos++] = '\\';
-            dst[pos++] = 't';
-        } else if (*p < 0x20) {
-            int n = snprintf(dst + pos, cap - pos, "\\u%04x", *p);
-            if (n > 0)
-                pos += (size_t) n;
-        } else {
-            dst[pos++] = (char) *p;
-        }
-    }
-    if (pos < cap)
-        dst[pos] = '\0';
-    return pos;
-}
 
 /* Recursive LKL directory helpers. */
 
@@ -2505,7 +2260,7 @@ static void send_rpc_err(int fd, const char *msg)
     char buf[1024];
     size_t pos = 0;
     pos += (size_t) snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"");
-    pos = json_escape_append(buf, sizeof(buf), pos, msg);
+    pos = kbox_json_escape_append(buf, sizeof(buf), pos, msg);
     snprintf(buf + pos, sizeof(buf) - pos, "\"}\n");
     send_rpc_line(fd, buf);
 }
@@ -2574,7 +2329,7 @@ static int parse_port_spec(const char *spec, struct port_binding_spec *out)
 static void handle_rpc_line(int client_fd, const char *req)
 {
     char op[64];
-    if (json_get_str(req, "op", op, sizeof(op)) < 0) {
+    if (kbox_json_get_str(req, "op", op, sizeof(op)) < 0) {
         send_rpc_err(client_fd, "missing op");
         return;
     }
@@ -2592,8 +2347,8 @@ static void handle_rpc_line(int client_fd, const char *req)
 
     if (strcmp(op, "image_import") == 0) {
         char img_id[128], src[PATH_MAX];
-        if (json_get_str(req, "id", img_id, sizeof(img_id)) < 0 ||
-            json_get_str(req, "src", src, sizeof(src)) < 0) {
+        if (kbox_json_get_str(req, "id", img_id, sizeof(img_id)) < 0 ||
+            kbox_json_get_str(req, "src", src, sizeof(src)) < 0) {
             send_rpc_err(client_fd, "image_import requires id and src");
             return;
         }
@@ -2601,8 +2356,8 @@ static void handle_rpc_line(int client_fd, const char *req)
         /* One slot more than the record can hold, so an image with too many
          * layers is rejected instead of silently losing its base layers. */
         char *layer_list[MAX_IMAGE_LAYERS + 1];
-        int layer_count =
-            json_get_str_array(req, "layers", layer_list, MAX_IMAGE_LAYERS + 1);
+        int layer_count = kbox_json_get_str_array(req, "layers", layer_list,
+                                                  MAX_IMAGE_LAYERS + 1);
         int li;
 
         if (layer_count > MAX_IMAGE_LAYERS) {
@@ -2644,8 +2399,8 @@ static void handle_rpc_line(int client_fd, const char *req)
 
     if (strcmp(op, "dns_set") == 0) {
         char name[KBOX_DAEMON_MAX_ALIAS], ip[32];
-        if (json_get_str(req, "name", name, sizeof(name)) < 0 ||
-            json_get_str(req, "ip", ip, sizeof(ip)) < 0) {
+        if (kbox_json_get_str(req, "name", name, sizeof(name)) < 0 ||
+            kbox_json_get_str(req, "ip", ip, sizeof(ip)) < 0) {
             send_rpc_err(client_fd, "dns_set requires name and ip");
             return;
         }
@@ -2661,10 +2416,10 @@ static void handle_rpc_line(int client_fd, const char *req)
         char ip[32];
         char host_ip[32];
         snprintf(host_ip, sizeof(host_ip), "0.0.0.0");
-        json_get_str(req, "host_ip", host_ip, sizeof(host_ip));
-        if (json_get_int(req, "host_port", &hp) < 0 ||
-            json_get_int(req, "container_port", &cp) < 0 ||
-            json_get_str(req, "ip", ip, sizeof(ip)) < 0) {
+        kbox_json_get_str(req, "host_ip", host_ip, sizeof(host_ip));
+        if (kbox_json_get_int(req, "host_port", &hp) < 0 ||
+            kbox_json_get_int(req, "container_port", &cp) < 0 ||
+            kbox_json_get_str(req, "ip", ip, sizeof(ip)) < 0) {
             send_rpc_err(client_fd, "port_add invalid args");
             return;
         }
@@ -2682,12 +2437,12 @@ static void handle_rpc_line(int client_fd, const char *req)
 
     if (strcmp(op, "container_create") == 0) {
         char cid[80], img[128], name[64];
-        if (json_get_str(req, "id", cid, sizeof(cid)) < 0 ||
-            json_get_str(req, "image", img, sizeof(img)) < 0) {
+        if (kbox_json_get_str(req, "id", cid, sizeof(cid)) < 0 ||
+            kbox_json_get_str(req, "image", img, sizeof(img)) < 0) {
             send_rpc_err(client_fd, "container_create requires id and image");
             return;
         }
-        if (json_get_str(req, "name", name, sizeof(name)) < 0)
+        if (kbox_json_get_str(req, "name", name, sizeof(name)) < 0)
             snprintf(name, sizeof(name), "%.12s", cid);
 
         pthread_mutex_lock(&g_cont_table_lock);
@@ -2727,14 +2482,14 @@ static void handle_rpc_line(int client_fd, const char *req)
         snprintf(slot->id, sizeof(slot->id), "%s", cid);
         snprintf(slot->name, sizeof(slot->name), "%s", name);
         snprintf(slot->image_id, sizeof(slot->image_id), "%s", img);
-        if (json_get_str(req, "hostname", slot->hostname,
-                         sizeof(slot->hostname)) < 0)
+        if (kbox_json_get_str(req, "hostname", slot->hostname,
+                              sizeof(slot->hostname)) < 0)
             snprintf(slot->hostname, sizeof(slot->hostname), "%.12s", cid);
-        if (json_get_str(req, "workdir", slot->workdir, sizeof(slot->workdir)) <
-            0)
+        if (kbox_json_get_str(req, "workdir", slot->workdir,
+                              sizeof(slot->workdir)) < 0)
             snprintf(slot->workdir, sizeof(slot->workdir), "/");
 
-        if (json_get_str(req, "ip", slot->ip, sizeof(slot->ip)) < 0 ||
+        if (kbox_json_get_str(req, "ip", slot->ip, sizeof(slot->ip)) < 0 ||
             !slot->ip[0])
             kbox_daemon_net_alloc_ip(slot->ip, sizeof(slot->ip));
 
@@ -2744,14 +2499,14 @@ static void handle_rpc_line(int client_fd, const char *req)
                  g_config.log_dir[0] ? g_config.log_dir : DAEMON_LOG_DIR, cid);
 
         slot->cmd_count =
-            json_get_str_array(req, "cmd", slot->cmd, MAX_CMD_ARGS);
+            kbox_json_get_str_array(req, "cmd", slot->cmd, MAX_CMD_ARGS);
         slot->env_count =
-            json_get_str_array(req, "env", slot->env, MAX_ENV_VARS);
+            kbox_json_get_str_array(req, "env", slot->env, MAX_ENV_VARS);
 
         char *bind_strs[KBOX_HOST_BINDS_MAX];
         memset(bind_strs, 0, sizeof(bind_strs));
-        int nb =
-            json_get_str_array(req, "binds", bind_strs, KBOX_HOST_BINDS_MAX);
+        int nb = kbox_json_get_str_array(req, "binds", bind_strs,
+                                         KBOX_HOST_BINDS_MAX);
         for (int i = 0; i < nb; i++) {
             if (kbox_parse_host_volume(bind_strs[i],
                                        &slot->binds[slot->bind_count]) == 0)
@@ -2761,7 +2516,8 @@ static void handle_rpc_line(int client_fd, const char *req)
 
         char *alias_strs[MAX_ALIASES];
         memset(alias_strs, 0, sizeof(alias_strs));
-        int na = json_get_str_array(req, "aliases", alias_strs, MAX_ALIASES);
+        int na =
+            kbox_json_get_str_array(req, "aliases", alias_strs, MAX_ALIASES);
         for (int i = 0; i < na; i++) {
             snprintf(slot->aliases[slot->alias_count++], KBOX_DAEMON_MAX_ALIAS,
                      "%s", alias_strs[i]);
@@ -2773,15 +2529,15 @@ static void handle_rpc_line(int client_fd, const char *req)
         snprintf(short_id, sizeof(short_id), "%.12s", slot->id);
         kbox_daemon_dns_register(short_id, slot->ip);
 
-        slot->host_net = json_get_bool(req, "host_net", 0);
+        slot->host_net = kbox_json_get_bool(req, "host_net", 0);
         {
             long ml = 0;
-            if (json_get_int(req, "mem_limit", &ml) == 0 && ml > 0)
+            if (kbox_json_get_int(req, "mem_limit", &ml) == 0 && ml > 0)
                 slot->mem_limit = ml;
         }
         char *port_strs[16];
         memset(port_strs, 0, sizeof(port_strs));
-        int np = json_get_str_array(req, "ports", port_strs, 16);
+        int np = kbox_json_get_str_array(req, "ports", port_strs, 16);
         for (int i = 0; i < np; i++) {
             if (slot->port_count < 16 &&
                 parse_port_spec(port_strs[i], &slot->ports[slot->port_count]) ==
@@ -2804,8 +2560,9 @@ static void handle_rpc_line(int client_fd, const char *req)
 
     if (strcmp(op, "exec_start") == 0) {
         char eid[80], cid_arg[80], wd[PATH_MAX];
-        if (json_get_str(req, "exec_id", eid, sizeof(eid)) < 0 ||
-            json_get_str(req, "container_id", cid_arg, sizeof(cid_arg)) < 0) {
+        if (kbox_json_get_str(req, "exec_id", eid, sizeof(eid)) < 0 ||
+            kbox_json_get_str(req, "container_id", cid_arg, sizeof(cid_arg)) <
+                0) {
             send_rpc_err(client_fd,
                          "exec_start requires exec_id and container_id");
             return;
@@ -2859,21 +2616,22 @@ static void handle_rpc_line(int client_fd, const char *req)
         /* `docker exec -i`: the frontend spools the request body to this path
          * before starting the exec, because the guest reads its stdin from a
          * host file it can seek and re-read, not from a live socket. */
-        if (json_get_str(req, "stdin_path", eslot->stdin_path,
-                         sizeof(eslot->stdin_path)) == 0 &&
+        if (kbox_json_get_str(req, "stdin_path", eslot->stdin_path,
+                              sizeof(eslot->stdin_path)) == 0 &&
             eslot->stdin_path[0]) {
             snprintf(eslot->stdin_file, sizeof(eslot->stdin_file), "%s",
                      eslot->stdin_path);
         }
 
-        if (json_get_str(req, "workdir", wd, sizeof(wd)) == 0 && wd[0])
+        if (kbox_json_get_str(req, "workdir", wd, sizeof(wd)) == 0 && wd[0])
             snprintf(eslot->workdir, sizeof(eslot->workdir), "%s", wd);
         else
             snprintf(eslot->workdir, sizeof(eslot->workdir), "%s", tc->workdir);
 
         eslot->cmd_count =
-            json_get_str_array(req, "cmd", eslot->cmd, MAX_CMD_ARGS);
-        int req_env = json_get_str_array(req, "env", eslot->env, MAX_ENV_VARS);
+            kbox_json_get_str_array(req, "cmd", eslot->cmd, MAX_CMD_ARGS);
+        int req_env =
+            kbox_json_get_str_array(req, "env", eslot->env, MAX_ENV_VARS);
         eslot->env_count = req_env;
         /* Merge container env if not already present in exec env. */
         for (int i = 0; i < tc->env_count && eslot->env_count < MAX_ENV_VARS;
@@ -2946,7 +2704,7 @@ static void handle_rpc_line(int client_fd, const char *req)
 
     if (strcmp(op, "exec_wait") == 0) {
         char eid[80];
-        if (json_get_str(req, "exec_id", eid, sizeof(eid)) < 0) {
+        if (kbox_json_get_str(req, "exec_id", eid, sizeof(eid)) < 0) {
             send_rpc_err(client_fd, "exec_wait requires exec_id");
             return;
         }
@@ -2984,7 +2742,7 @@ static void handle_rpc_line(int client_fd, const char *req)
     }
 
     char cid[80];
-    if (json_get_str(req, "id", cid, sizeof(cid)) < 0) {
+    if (kbox_json_get_str(req, "id", cid, sizeof(cid)) < 0) {
         send_rpc_err(client_fd, "missing container id");
         return;
     }
@@ -3046,7 +2804,7 @@ static void handle_rpc_line(int client_fd, const char *req)
 
     if (strcmp(op, "container_stop") == 0) {
         long timeout_s = 10;
-        (void) json_get_int(req, "timeout", &timeout_s);
+        (void) kbox_json_get_int(req, "timeout", &timeout_s);
         if (timeout_s < 1)
             timeout_s = 1;
 
@@ -3077,7 +2835,7 @@ static void handle_rpc_line(int client_fd, const char *req)
 
     if (strcmp(op, "container_kill") == 0) {
         long sig = SIGKILL;
-        (void) json_get_int(req, "signal", &sig);
+        (void) kbox_json_get_int(req, "signal", &sig);
         pthread_mutex_lock(&c->lock);
         if (c->state == CONT_RUNNING && c->child_pid > 0)
             kill(-c->child_pid, (int) sig);
@@ -3121,7 +2879,7 @@ static void handle_rpc_line(int client_fd, const char *req)
     }
 
     if (strcmp(op, "container_rm") == 0) {
-        int force = json_get_bool(req, "force", 0);
+        int force = kbox_json_get_bool(req, "force", 0);
         pthread_mutex_lock(&c->lock);
         if ((c->state == CONT_RUNNING || c->state == CONT_STARTING) && !force) {
             pthread_mutex_unlock(&c->lock);

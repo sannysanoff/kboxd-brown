@@ -92,8 +92,10 @@ void test_pass(void)
 extern void test_fd_table_init(void);
 extern void test_path_init(void);
 extern void test_locks_init(void);
+extern void test_bind_path_init(void);
 extern void test_mount_init(void);
 extern void test_cli_init(void);
+extern void test_daemon_json_init(void);
 extern void test_identity_init(void);
 extern void test_vcred_init(void);
 extern void test_syscall_nr_init(void);
@@ -127,6 +129,7 @@ int main(int argc, char *argv[])
     test_bind_path_init();
     test_mount_init();
     test_cli_init();
+    test_daemon_json_init();
     test_identity_init();
     test_vcred_init();
     test_syscall_nr_init();
