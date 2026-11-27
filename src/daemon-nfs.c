@@ -397,7 +397,11 @@ int kbox_daemon_nfs_bind_container(const struct kbox_sysnrs *s,
          * never turn a FILE into a directory: a compose file binds single files
          * such as clickhouse-prometheus.xml, and creating the destination as a
          * directory makes the bind fail with "Not a directory" even though the
-         * source is a regular file. */
+         * source is a regular file.
+         *
+         * The destination of a file bind must itself be a regular file: LKL's
+         * bind does not create the target, so leaving only the parent fails
+         * with ENOENT even though the source is present. */
         if ((size_t) snprintf(dst, sizeof(dst), "%s%s", rootfs,
                               b->guest_path) >= sizeof(dst)) {
             snprintf(err, err_size, "destination path too long: %s",
@@ -407,12 +411,20 @@ int kbox_daemon_nfs_bind_container(const struct kbox_sysnrs *s,
         {
             char src_mkdir[KBOX_MAX_PATH];
             char dst_mkdir[KBOX_MAX_PATH];
-            kbox_nfs_bind_plan(nfs_source_is_file(s, src), src, dst, src_mkdir,
+            int src_is_file = nfs_source_is_file(s, src);
+            kbox_nfs_bind_plan(src_is_file, src, dst, src_mkdir,
                                sizeof(src_mkdir), dst_mkdir, sizeof(dst_mkdir));
             if (src_mkdir[0])
                 lkl_mkdir_p_daemon(s, src_mkdir, 0755);
             if (dst_mkdir[0])
                 lkl_mkdir_p_daemon(s, dst_mkdir, 0755);
+            if (src_is_file) {
+                long fd =
+                    kbox_lkl_openat(s, AT_FDCWD_LINUX, dst,
+                                    0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
+                if (fd >= 0)
+                    kbox_lkl_close(s, fd);
+            }
         }
 
         ret = kbox_lkl_mount(s, src, dst, NULL, KBOX_MS_BIND, NULL);
