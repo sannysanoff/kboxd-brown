@@ -645,24 +645,41 @@ static int json_get_str_array(const char *json,
         return 0;
     const char *p = skip_ws(v + 1);
     int count = 0;
-    char *tmp = malloc(4096);
-    if (!tmp)
-        return 0;
 
     while (*p && *p != ']' && count < max_items) {
         if (*p == ',') {
             p = skip_ws(p + 1);
             continue;
         }
-        const char *next = parse_json_string(p, tmp, 4096);
-        if (!next)
+        /* Size the buffer to the literal rather than a fixed page: an argv
+         * entry is not bounded by 4096 and a short cap silently truncates it.
+         */
+        const char *q = p;
+        size_t need = 0;
+        if (*q == '"') {
+            q++;
+            while (*q && *q != '"') {
+                if (*q == '\\' && q[1])
+                    q++;
+                q++;
+                need++;
+            }
+        }
+        char *tmp = malloc(need + 1);
+        if (!tmp)
             break;
-        out[count] = strdup(tmp);
+        const char *next = parse_json_string(p, tmp, need + 1);
+        if (!next) {
+            free(tmp);
+            break;
+        }
+        out[count] = tmp;
         if (out[count])
             count++;
+        else
+            free(tmp);
         p = skip_ws(next);
     }
-    free(tmp);
     return count;
 }
 
@@ -1596,8 +1613,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
         /* Without this file the container runs with its output going nowhere
          * and `docker logs` answers empty for a container that worked. Report
          * the cause instead of starting a silent black hole. */
-        fprintf(stderr, "kboxd: open log %s: %s\n", log_path,
-                strerror(errno));
+        fprintf(stderr, "kboxd: open log %s: %s\n", log_path, strerror(errno));
         hooks->on_failed(hooks->opaque, "container log file is not writable");
         return -1;
     }
@@ -3288,7 +3304,8 @@ int kbox_daemon_run(const char *sock_path, const char *cmdline, int verbose)
 
     /* Container logs live here; created after the config is read because the
      * directory is configurable. */
-    if (mkdir(g_config.log_dir[0] ? g_config.log_dir : DAEMON_LOG_DIR, 0777) < 0 &&
+    if (mkdir(g_config.log_dir[0] ? g_config.log_dir : DAEMON_LOG_DIR, 0777) <
+            0 &&
         errno != EEXIST) {
         fprintf(stderr, "kboxd: mkdir %s: %s\n",
                 g_config.log_dir[0] ? g_config.log_dir : DAEMON_LOG_DIR,
