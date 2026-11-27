@@ -50,16 +50,6 @@ static inline long to_dirfd_arg(uint64_t v)
     return (long) (int) (uint32_t) v;
 }
 
-/* Return nonzero if req was delivered via SIGSYS trap or syscall rewrite rather
- * than the seccomp user-notification path.
- */
-static inline int request_uses_trap_signals(
-    const struct kbox_syscall_request *req)
-{
-    return req && (req->source == KBOX_SYSCALL_SOURCE_TRAP ||
-                   req->source == KBOX_SYSCALL_SOURCE_REWRITE);
-}
-
 /* Return 1 if an FD-based I/O syscall should fail with EBADF rather than
  * CONTINUE for a not-in-table FD.  Only tracked FDs (lkl_fd >= 0 for LKL
  * files, KBOX_LKL_FD_SHADOW_ONLY for host-passthrough pipes/eventfds/proc

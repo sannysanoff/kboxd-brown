@@ -8,7 +8,6 @@
 #include <string.h>
 
 #include "kbox/cli.h"
-#include "rewrite.h"
 
 /* Long option codes for options without short equivalents */
 enum {
@@ -80,8 +79,8 @@ void kbox_usage(const char *argv0)
         "      --forward-verbose      Verbose syscall forwarding\n"
         "      --net                  Enable SLIRP user-mode networking\n"
         "      --mount-profile P      Mount profile: full (default), minimal\n"
-        "      --syscall-mode MODE    Syscall path: auto (default), "
-        "seccomp, trap, rewrite\n"
+        "      --syscall-mode MODE    Accepted for compatibility: seccomp, "
+        "auto\n"
         "      --sqpoll               Busy-poll service thread (no futex)\n"
         "      --web[=PORT]           Enable web observatory (default: 8080)\n"
         "      --web-bind ADDR        Bind address for web (default: "
@@ -111,7 +110,6 @@ int kbox_parse_args(int argc, char *argv[], struct kbox_image_args *img)
     img->command = "/bin/sh";
     img->cmdline = "mem=1024M loglevel=4";
     img->mount_profile = KBOX_MOUNT_FULL;
-    img->syscall_mode = KBOX_SYSCALL_MODE_AUTO;
 
     /* Reset getopt state; kbox_parse_args may be called more than once
      * (e.g. across unit tests). */
@@ -229,10 +227,12 @@ int kbox_parse_args(int argc, char *argv[], struct kbox_image_args *img)
 #endif
             break;
         case OPT_SYSCALL_MODE:
-            if (kbox_parse_syscall_mode(optarg, &img->syscall_mode) < 0) {
+            /* seccomp is the only path; the flag stays for old command lines
+             * that still spell out the old fast-path names. */
+            if (strcmp(optarg, "seccomp") != 0 && strcmp(optarg, "auto") != 0) {
                 fprintf(stderr,
-                        "unknown syscall mode: %s "
-                        "(use 'seccomp', 'trap', 'rewrite', or 'auto')\n",
+                        "kbox: --syscall-mode=%s is gone: kbox always runs the "
+                        "seccomp supervisor path\n",
                         optarg);
                 return -1;
             }

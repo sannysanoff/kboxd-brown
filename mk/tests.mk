@@ -14,7 +14,6 @@ TEST_SRCS  = $(TEST_DIR)/test-runner.c \
              $(TEST_DIR)/test-elf.c \
              $(TEST_DIR)/test-locks.c \
              $(TEST_DIR)/test-bind-path.c \
-             $(TEST_DIR)/test-x86-decode.c \
              $(TEST_DIR)/test-daemon-json.c \
              $(TEST_DIR)/test-daemon-resolv.c \
              $(TEST_DIR)/test-nfs-plan.c \
@@ -22,17 +21,8 @@ TEST_SRCS  = $(TEST_DIR)/test-runner.c \
 
 # Linux-only tests (depend on inline asm, siginfo_t/ucontext, memfd_create):
 ifeq ($(shell uname -s),Linux)
-TEST_SRCS += $(TEST_DIR)/test-rewrite.c \
-             $(TEST_DIR)/test-procmem.c \
-             $(TEST_DIR)/test-syscall-request.c \
-             $(TEST_DIR)/test-syscall-trap.c \
-             $(TEST_DIR)/test-loader-entry.c \
-             $(TEST_DIR)/test-loader-handoff.c \
-             $(TEST_DIR)/test-loader-image.c \
-             $(TEST_DIR)/test-loader-layout.c \
-             $(TEST_DIR)/test-loader-launch.c \
-             $(TEST_DIR)/test-loader-stack.c \
-             $(TEST_DIR)/test-loader-transfer.c
+TEST_SRCS += $(TEST_DIR)/test-procmem.c \
+             $(TEST_DIR)/test-syscall-request.c
 endif
 
 # Unit tests link only the pure-computation sources (no LKL)
@@ -47,25 +37,15 @@ TEST_SUPPORT_SRCS = $(SRC_DIR)/fd-table.c \
                     $(SRC_DIR)/vcred.c \
                     $(SRC_DIR)/syscall-nr.c \
                     $(SRC_DIR)/elf.c \
-                    $(SRC_DIR)/x86-decode.c \
                     $(SRC_DIR)/jsonreq.c \
                     $(SRC_DIR)/resolv.c \
                     $(SRC_DIR)/nfs-plan.c \
                     $(SRC_DIR)/nfs-fresh.c
 
 ifeq ($(shell uname -s),Linux)
-TEST_SUPPORT_SRCS += $(SRC_DIR)/rewrite.c \
-                     $(TEST_DIR)/test-seccomp-stubs.c \
+TEST_SUPPORT_SRCS += $(TEST_DIR)/test-seccomp-stubs.c \
                      $(SRC_DIR)/procmem.c \
-                     $(SRC_DIR)/syscall-request.c \
-                     $(SRC_DIR)/syscall-trap.c \
-                     $(SRC_DIR)/loader-entry.c \
-                     $(SRC_DIR)/loader-handoff.c \
-                     $(SRC_DIR)/loader-image.c \
-                     $(SRC_DIR)/loader-layout.c \
-                     $(SRC_DIR)/loader-launch.c \
-                     $(SRC_DIR)/loader-stack.c \
-                     $(SRC_DIR)/loader-transfer.c
+                     $(SRC_DIR)/syscall-request.c
 endif
 
 TEST_TARGET  = tests/unit/test-runner

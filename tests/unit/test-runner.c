@@ -103,21 +103,11 @@ extern void test_identity_init(void);
 extern void test_vcred_init(void);
 extern void test_syscall_nr_init(void);
 extern void test_elf_init(void);
-extern void test_x86_decode_init(void);
 
 /* Linux-only test suites */
 #ifdef __linux__
 extern void test_procmem_init(void);
 extern void test_syscall_request_init(void);
-extern void test_syscall_trap_init(void);
-extern void test_loader_entry_init(void);
-extern void test_loader_handoff_init(void);
-extern void test_loader_image_init(void);
-extern void test_loader_layout_init(void);
-extern void test_loader_launch_init(void);
-extern void test_loader_stack_init(void);
-extern void test_loader_transfer_init(void);
-extern void test_rewrite_init(void);
 #endif
 
 int main(int argc, char *argv[])
@@ -140,21 +130,11 @@ int main(int argc, char *argv[])
     test_vcred_init();
     test_syscall_nr_init();
     test_elf_init();
-    test_x86_decode_init();
 
     /* Linux-only suites */
 #ifdef __linux__
     test_procmem_init();
     test_syscall_request_init();
-    test_syscall_trap_init();
-    test_loader_entry_init();
-    test_loader_handoff_init();
-    test_loader_image_init();
-    test_loader_layout_init();
-    test_loader_launch_init();
-    test_loader_stack_init();
-    test_loader_transfer_init();
-    test_rewrite_init();
 #endif
 
     /* Run all tests */

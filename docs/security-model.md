@@ -18,7 +18,7 @@ kernel and BPF policy. W^X enforcement prevents simultaneous
 However, seccomp filtering is a [building block for sandboxes, not a
 sandbox itself](https://www.kernel.org/doc/html/latest/userspace-api/seccomp_filter.html).
 kbox runs LKL and the supervisor in the same address space as the guest
-(especially in trap/rewrite mode). This design delivers low overhead and
+This design delivers low overhead and
 deep observability, but it means a memory-safety bug in the dispatch path
 or LKL could be exploitable by a crafted guest binary.
 

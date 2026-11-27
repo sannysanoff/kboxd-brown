@@ -18,13 +18,10 @@ Every intercepted syscall is dispatched to one of three dispositions:
   and similar): filesystem operations (open, read,
   write, stat, getdents, mkdir, unlink, rename), metadata (chmod,
   chown, utimensat), identity (getuid, setuid, getgroups), and
-  networking (socket, connect). In seccomp mode, the supervisor reads
-  arguments from tracee memory via `process_vm_readv` and writes
-  results via `process_vm_writev`. In trap/rewrite mode, guest memory
-  is accessed directly via `memcpy` (same address space) with
-  `sigsetjmp`-based fault recovery that returns `-EFAULT` for unmapped
-  pointers. An FD-local stat cache (16 entries, round-robin) avoids
-  repeated LKL inode lookups for fstat.
+  networking (socket, connect). The supervisor reads arguments from
+  tracee memory via `process_vm_readv` and writes results via
+  `process_vm_writev`. An FD-local stat cache (16 entries, round-robin)
+  avoids repeated LKL inode lookups for fstat.
 - **Host CONTINUE** (~50 entries): scheduling (sched_yield,
   sched_setscheduler), signals (rt_sigaction, kill, tgkill), memory
   management (mprotect, brk, munmap, mremap, madvise), I/O
@@ -162,30 +159,6 @@ ret`) are patched to `jmp rel32` targeting a wrapper trampoline that
 encodes the syscall number and origin address. Bare 2-byte `syscall`
 instructions are not rewritten because the only same-width replacement
 (`call *%rax`, `FF D0`) would jump to the syscall number in RAX rather
-than a code address. Unpatched sites fall through to the SIGSYS trap
-path. However, the guest-thread local fast-path
-(`kbox_dispatch_try_local_fast_path`) handles ~40 high-frequency
-syscalls (futex, brk, poll/ppoll/pselect6, munmap, mremap, madvise,
-sched_yield, the rest of the sched_* family, wait4/waitid, fork/vfork,
-setpgid/getpgid, statfs, sysinfo, clock_nanosleep, etc.) directly on
-the guest thread without any service-thread IPC, giving trap mode a
-measurable advantage over seccomp for operations surrounded by these
-host-kernel calls. `mmap` and `epoll_*` are deliberately excluded
-because they need W^X enforcement, shadow validation, or FD-table
-gating that the fast-path cannot perform.
-
-On **riscv64**, the rewrite mode is not available now.
-
-Each site is classified as WRAPPER (simple `syscall; ret` pattern,
-eligible for inline virtualized return: getpid=1, gettid=1, getppid=0)
-or COMPLEX (result consumed internally by helpers like `raise()` that
-feed gettid into tgkill; must use full dispatch). An origin map
-validates dispatch calls against known rewrite sites and carries the
-per-site classification. During re-exec (`trap_userspace_exec`), the
-rewrite runtime is re-installed on the new binary. Multi-threaded
-guests (`CLONE_THREAD`) are blocked in trap/rewrite mode; use
-`--syscall-mode=seccomp` for threaded workloads.
-
 ## ABI translation
 
 LKL is built as `ARCH=lkl`, which uses asm-generic headers. On x86_64,
@@ -212,14 +185,10 @@ layer translates these bidirectionally.
 The dashboard (`--web` flag, `KBOX_HAS_WEB=1` build) reads LKL's
 in-process `/proc` directly. Implementation notes:
 
-- Telemetry is currently driven exclusively by the seccomp supervisor
-  loop. `kbox_web_record_syscall` is only called from
+- Telemetry is driven by the seccomp supervisor loop.
+  `kbox_web_record_syscall` is only called from
   `src/seccomp-supervisor.c:423`, and `kbox_web_tick()` runs from the
-  same supervisor poll loop. Trap and rewrite modes do not yet emit
-  per-syscall events or drive the periodic sampler -- the supervisor
-  context is initialized (so the HTTP server stays up) but the event
-  ring stays empty for those modes. Pin `--syscall-mode=seccomp` if
-  you need the full audit trail.
+  same supervisor poll loop.
 - The telemetry sampler runs on the seccomp supervisor's poll timeout
   (100ms tick), reading LKL `/proc/stat`, `/proc/meminfo`,
   `/proc/vmstat`, `/proc/loadavg` via `kbox_lkl_openat`/`kbox_lkl_read`.

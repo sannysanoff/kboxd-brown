@@ -36,10 +36,8 @@ supervisor while the guest executes.
   overhead). The SSE event stream (`/api/events`) and JSON trace mode
   (`--trace-format json`) produce structured records of every dispatch
   decision: which syscall, which disposition (LKL forward, host CONTINUE,
-  or emulated), and how long it took. Trap and rewrite modes do not
-  currently emit these per-syscall records; agent frameworks that need
-  a complete trail should pin `--syscall-mode=seccomp`. BPF-denied
-  syscalls (`ptrace`, `bpf`, `reboot`, `init_module`, etc.) return
+  or emulated), and how long it took. BPF-denied
+  syscalls (`ptrace`, `bpf`, `init_module`, etc.) return
   `EPERM` before the supervisor sees them.
 - **Real Linux semantics**: agents get Linux kernel semantics for VFS,
   ext4, and procfs via LKL, not a userspace syscall reimplementation.
@@ -48,23 +46,19 @@ supervisor while the guest executes.
   works on a developer machine but breaks in the sandbox because the
   sandbox's syscall emulation is incomplete.
 - **Low per-call overhead**: in-process LKL boot, no VM or container
-  daemon. The `auto` mode selects the fastest interception tier per
-  command: trap/rewrite for direct binaries (~3us stat on aarch64,
-  ~1.4x faster `lseek+read` on x86_64 vs seccomp), seccomp for shell
-  pipelines. Short-lived tool calls complete without amortizing
+  daemon. Short-lived tool calls complete without amortizing
   multi-second startup costs that dominate agent latency budgets.
 - **Programmable dispatch point**: the unified dispatch engine is the
   natural insertion point for future per-agent policy (path allowlists,
-  socket rules, syscall quotas). All three interception tiers share
-  this path. The underlying request abstraction (`kbox_syscall_request`)
+  socket rules, syscall quotas). The underlying request abstraction
+  (`kbox_syscall_request`)
   already decouples policy decisions from the notification transport,
   but no user-facing policy hook exists yet.
 - **Deterministic initial rootfs**: the ext4 disk image provides a known
   starting state. For reproducible agent evaluation, mount read-only or
   clone the image per run; the default mount is read-write. Combined
-  with `--syscall-mode=seccomp` (strongest isolation) and a fixed kernel
-  cmdline, this gives repeatable initial conditions for benchmark
-  comparisons across agent runs.
+  with a fixed kernel cmdline, this gives repeatable initial conditions
+  for benchmark comparisons across agent runs.
 
 ## Recommended agent deployment
 

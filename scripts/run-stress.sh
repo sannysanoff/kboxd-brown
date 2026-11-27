@@ -20,10 +20,8 @@ KBOX="${1:-./kbox}"
 ROOTFS="${2:-rootfs.ext4}"
 
 # Stress tests exercise threads (concurrent-io), interval timers
-# (signal-race), and rapid fork/wait (rapid-fork).  These require
-# seccomp mode: trap/rewrite mode denies CLONE_THREAD by design and
-# has signal-handler re-entrancy constraints that break setitimer.
-KBOX_MODE_FLAGS="--syscall-mode=seccomp"
+# (signal-race), and rapid fork/wait (rapid-fork).
+KBOX_MODE_FLAGS=""
 PASS=0
 FAIL=0
 SKIP=0

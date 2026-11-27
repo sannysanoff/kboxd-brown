@@ -13,20 +13,10 @@ SRCS     = $(SRC_DIR)/main.c \
            $(SRC_DIR)/vcred.c \
            $(SRC_DIR)/procmem.c \
            $(SRC_DIR)/syscall-request.c \
-           $(SRC_DIR)/syscall-trap.c \
            $(SRC_DIR)/path.c \
            $(SRC_DIR)/locks.c \
            $(SRC_DIR)/identity.c \
            $(SRC_DIR)/elf.c \
-           $(SRC_DIR)/loader-entry.c \
-           $(SRC_DIR)/loader-handoff.c \
-           $(SRC_DIR)/loader-image.c \
-           $(SRC_DIR)/loader-layout.c \
-           $(SRC_DIR)/loader-launch.c \
-           $(SRC_DIR)/loader-stack.c \
-           $(SRC_DIR)/loader-transfer.c \
-           $(SRC_DIR)/x86-decode.c \
-           $(SRC_DIR)/rewrite.c \
            $(SRC_DIR)/mount.c \
            $(SRC_DIR)/probe.c \
            $(SRC_DIR)/image.c \

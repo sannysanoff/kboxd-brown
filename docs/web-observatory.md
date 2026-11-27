@@ -12,8 +12,7 @@ from the outside. The web observatory shows guest-kernel counters that
 rising, softirq totals climbing, ENOSYS hits piling up.
 
 Note: the dashboard is currently driven by the seccomp supervisor, so it
-works in seccomp mode (`--syscall-mode=seccomp`, the auto default for
-shells and `--net`). Trap and rewrite modes do not yet drive the sampler
+works in seccomp mode, the only syscall path.
 or emit per-syscall events.
 
 Traditional kernel observation requires root (ftrace, perf), serial

@@ -296,34 +296,24 @@ static int probe_yama_scope(void)
 
 /* Public entry point. */
 
-int kbox_collect_probe_result(enum kbox_syscall_mode mode,
-                              struct kbox_probe_result *out)
+int kbox_collect_probe_result(struct kbox_probe_result *out)
 {
-    int need_supervisor = 0;
-
     if (!out)
         return -1;
 
     memset(out, 0, sizeof(*out));
 
-    if (mode == KBOX_SYSCALL_MODE_SECCOMP || mode == KBOX_SYSCALL_MODE_AUTO)
-        need_supervisor = 1;
-
     out->no_new_privs_ok = probe_no_new_privs() == 0;
     out->seccomp_filter_ok = probe_seccomp_filter_basic() == 0;
-
-    if (need_supervisor) {
-        out->seccomp_listener_ok = probe_seccomp_listener() == 0;
-        out->process_vm_readv_ok = probe_process_vm_readv() == 0;
-    }
+    out->seccomp_listener_ok = probe_seccomp_listener() == 0;
+    out->process_vm_readv_ok = probe_process_vm_readv() == 0;
 
     return 0;
 }
 
-int kbox_probe_host_features(enum kbox_syscall_mode mode)
+int kbox_probe_host_features(void)
 {
     int failures = 0;
-    int need_supervisor = 0;
     struct kbox_probe_result result;
 
     fprintf(stderr, "kbox: probing host features...\n");
@@ -331,36 +321,17 @@ int kbox_probe_host_features(enum kbox_syscall_mode mode)
     /* Advisory check first. */
     probe_yama_scope();
 
-    if (kbox_collect_probe_result(mode, &result) < 0)
+    if (kbox_collect_probe_result(&result) < 0)
         return -1;
-
-    if (mode == KBOX_SYSCALL_MODE_SECCOMP)
-        need_supervisor = 1;
 
     if (!result.no_new_privs_ok)
         failures++;
     if (!result.seccomp_filter_ok)
         failures++;
-
-    if (need_supervisor) {
-        if (!result.seccomp_listener_ok)
-            failures++;
-        if (!result.process_vm_readv_ok)
-            failures++;
-    }
-
-    /* AUTO probes supervisor features but only warns (doesn't fail).
-     * The launch path selects trap for direct binaries and seccomp
-     * for shells.  If seccomp-unotify is unavailable, AUTO still
-     * works for direct binaries via the trap path.
-     */
-    if (mode == KBOX_SYSCALL_MODE_AUTO) {
-        if (!result.seccomp_listener_ok || !result.process_vm_readv_ok) {
-            fprintf(stderr,
-                    "kbox: WARN -- seccomp-unotify features unavailable; "
-                    "AUTO mode restricted to trap fast path only\n");
-        }
-    }
+    if (!result.seccomp_listener_ok)
+        failures++;
+    if (!result.process_vm_readv_ok)
+        failures++;
 
     if (failures > 0) {
         fprintf(stderr,

@@ -69,19 +69,13 @@ int main(void)
     CHECK(raise(SIGURG) == 0, "raise SIGURG");
     CHECK(got_sigurg == 1, "SIGURG handler ran");
 
-    /* Verify SIGSYS handler installation is denied (reserved). */
+    /* SIGSYS sigaction goes to CONTINUE, so the host kernel handles it and
+     * the call may succeed. */
     sa.sa_handler = SIG_IGN;
     if (sigaction(SIGSYS, &sa, NULL) == 0) {
-        /* In seccomp mode SIGSYS sigaction goes to CONTINUE (host
-         * kernel handles it), so this may succeed.  In trap/rewrite
-         * mode it must fail with EPERM.  Accept either outcome.
-         */
     }
 
-    /* Verify SIGSYS is not visible in the signal mask.
-     * In trap/rewrite mode, kbox must strip SIGSYS from the mask
-     * reported to the guest.  In seccomp mode, the host handles
-     * sigprocmask directly and SIGSYS should not be blocked.
+    /* The host handles sigprocmask directly, so SIGSYS should not be blocked.
      */
     {
         sigset_t cur;

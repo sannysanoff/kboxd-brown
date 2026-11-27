@@ -120,10 +120,8 @@ union kbox_semun {
 #include "kbox/identity.h"
 #include "kbox/path.h"
 #include "lkl-wrap.h"
-#include "loader-launch.h"
 #include "net.h"
 #include "procmem.h"
-#include "rewrite.h"
 #include "seccomp.h"
 
 /* Diagnostic helpers, enabled with KBOX_FD_TRACE=1. */
@@ -134,8 +132,6 @@ static void fd_trace_table(const char *tag,
 
 #include "shadow-fd.h"
 #include "syscall-nr.h"
-#include "syscall-trap-signal.h"
-#include "syscall-trap.h"
 #include "vcred.h"
 
 /* Per-thread scratch buffer for I/O dispatch. Each supervisor thread is
@@ -146,165 +142,6 @@ static void fd_trace_table(const char *tag,
  */
 __thread uint8_t dispatch_scratch[KBOX_IO_CHUNK_LEN];
 
-static int request_blocks_reserved_sigsys(
-    const struct kbox_syscall_request *req,
-    struct kbox_supervisor_ctx *ctx)
-{
-    uint64_t set_ptr;
-    size_t sigset_size;
-    unsigned char mask[16];
-    size_t read_len;
-    int rc;
-
-    if (!req)
-        return 0;
-    set_ptr = kbox_syscall_request_arg(req, 1);
-    sigset_size = (size_t) kbox_syscall_request_arg(req, 3);
-    if (set_ptr == 0 || sigset_size == 0)
-        return 0;
-
-    read_len = sigset_size;
-    if (read_len > sizeof(mask))
-        read_len = sizeof(mask);
-    memset(mask, 0, sizeof(mask));
-
-    rc = guest_mem_read(ctx, kbox_syscall_request_pid(req), set_ptr, mask,
-                        read_len);
-    if (rc < 0)
-        return rc;
-
-    return kbox_syscall_trap_sigset_blocks_reserved(mask, read_len) ? 1 : 0;
-}
-
-static struct kbox_dispatch emulate_trap_rt_sigprocmask(
-    const struct kbox_syscall_request *req,
-    struct kbox_supervisor_ctx *ctx)
-{
-    long how = to_c_long_arg(kbox_syscall_request_arg(req, 0));
-    uint64_t set_ptr = kbox_syscall_request_arg(req, 1);
-    uint64_t old_ptr = kbox_syscall_request_arg(req, 2);
-    size_t sigset_size = (size_t) kbox_syscall_request_arg(req, 3);
-    unsigned char current[sizeof(sigset_t)];
-    unsigned char next[sizeof(sigset_t)];
-    unsigned char pending[sizeof(sigset_t)];
-    unsigned char set_mask[sizeof(sigset_t)];
-    size_t mask_len;
-
-    memset(current, 0, sizeof(current));
-    memset(next, 0, sizeof(next));
-
-    if (sigset_size == 0 || sigset_size > sizeof(current))
-        return kbox_dispatch_errno(EINVAL);
-    mask_len = sigset_size;
-
-    /* In TRAP mode the signal mask lives in the ucontext delivered by kernel;
-     * modifying it there takes effect when the handler returns.
-     * In REWRITE mode there is no ucontext; the rewrite dispatch runs as normal
-     * function call, so fall back to sigprocmask(2) directly.
-     */
-    if (kbox_syscall_trap_get_sigmask(current, sizeof(current)) < 0) {
-        sigset_t tmp;
-        if (sigprocmask(SIG_SETMASK, NULL, &tmp) < 0)
-            return kbox_dispatch_errno(EIO);
-        memcpy(current, &tmp, sizeof(current));
-    }
-
-    memset(set_mask, 0, sizeof(set_mask));
-    memcpy(next, current, sizeof(next));
-
-    if (set_ptr != 0) {
-        int rc = guest_mem_read(ctx, kbox_syscall_request_pid(req), set_ptr,
-                                set_mask, mask_len);
-        if (rc < 0)
-            return kbox_dispatch_errno(-rc);
-    }
-
-    if (old_ptr != 0) {
-        /* Strip SIGSYS from the reported mask -- the guest must not
-         * observe kbox's reserved signal in its signal state.
-         */
-        unsigned char visible[sizeof(sigset_t)];
-
-        memcpy(visible, current, sizeof(visible));
-        kbox_syscall_trap_sigset_strip_reserved(visible, sizeof(visible));
-        int rc = guest_mem_write(ctx, kbox_syscall_request_pid(req), old_ptr,
-                                 visible, mask_len);
-        if (rc < 0)
-            return kbox_dispatch_errno(-rc);
-    }
-
-    if (set_ptr != 0) {
-        switch (how) {
-        case SIG_BLOCK:
-            for (size_t i = 0; i < mask_len; i++)
-                next[i] |= set_mask[i];
-            break;
-        case SIG_UNBLOCK:
-            for (size_t i = 0; i < mask_len; i++)
-                next[i] &= (unsigned char) ~set_mask[i];
-            break;
-        case SIG_SETMASK:
-            memcpy(next, set_mask, mask_len);
-            break;
-        default:
-            return kbox_dispatch_errno(EINVAL);
-        }
-    }
-
-    if (kbox_syscall_trap_set_sigmask(next, sizeof(next)) < 0) {
-        sigset_t apply;
-        memcpy(&apply, next, sizeof(next));
-        if (sigprocmask(SIG_SETMASK, &apply, NULL) < 0)
-            return kbox_dispatch_errno(EIO);
-    }
-
-    if (kbox_syscall_trap_get_pending(pending, sizeof(pending)) == 0) {
-        for (size_t i = 0; i < sizeof(pending); i++)
-            pending[i] &= next[i];
-        (void) kbox_syscall_trap_set_pending(pending, sizeof(pending));
-    }
-
-    return kbox_dispatch_value(0);
-}
-
-static int trap_sigmask_contains_signal(int signo)
-{
-    sigset_t current;
-
-    if (signo <= 0)
-        return 0;
-    if (kbox_syscall_trap_get_sigmask(&current, sizeof(current)) < 0)
-        return 0;
-    return sigismember(&current, signo) == 1;
-}
-
-static struct kbox_dispatch emulate_trap_rt_sigpending(
-    const struct kbox_syscall_request *req,
-    struct kbox_supervisor_ctx *ctx)
-{
-    uint64_t set_ptr = kbox_syscall_request_arg(req, 0);
-    size_t sigset_size = (size_t) kbox_syscall_request_arg(req, 1);
-    unsigned char pending[sizeof(sigset_t)];
-    int rc;
-
-    if (set_ptr == 0)
-        return kbox_dispatch_errno(EFAULT);
-    if (sigset_size == 0 || sigset_size > sizeof(pending))
-        return kbox_dispatch_errno(EINVAL);
-    if (kbox_syscall_trap_get_pending(pending, sizeof(pending)) < 0)
-        return kbox_dispatch_errno(EIO);
-
-    /* Strip SIGSYS from pending set -- the guest must not observe
-     * kbox's reserved signal as pending.
-     */
-    kbox_syscall_trap_sigset_strip_reserved(pending, sizeof(pending));
-
-    rc = guest_mem_write(ctx, kbox_syscall_request_pid(req), set_ptr, pending,
-                         sigset_size);
-    if (rc < 0)
-        return kbox_dispatch_errno(-rc);
-    return kbox_dispatch_value(0);
-}
 
 struct kbox_fd_inject_ops {
     int (*addfd)(const struct kbox_supervisor_ctx *ctx,
@@ -339,56 +176,6 @@ static int seccomp_request_addfd_at(const struct kbox_supervisor_ctx *ctx,
 static const struct kbox_fd_inject_ops seccomp_fd_inject_ops = {
     .addfd = seccomp_request_addfd,
     .addfd_at = seccomp_request_addfd_at,
-};
-
-static int local_request_addfd(const struct kbox_supervisor_ctx *ctx,
-                               uint64_t cookie,
-                               int srcfd,
-                               uint32_t newfd_flags)
-{
-    int ret;
-
-    (void) ctx;
-    (void) cookie;
-#ifdef F_DUPFD_CLOEXEC
-    if (newfd_flags & O_CLOEXEC) {
-        ret = (int) kbox_syscall_trap_host_syscall6(SYS_fcntl, (uint64_t) srcfd,
-                                                    (uint64_t) F_DUPFD_CLOEXEC,
-                                                    0, 0, 0, 0);
-        return ret >= 0 ? ret : -(int) -ret;
-    }
-#endif
-    ret = (int) kbox_syscall_trap_host_syscall6(SYS_fcntl, (uint64_t) srcfd,
-                                                (uint64_t) F_DUPFD, 0, 0, 0, 0);
-    return ret >= 0 ? ret : -(int) -ret;
-}
-
-static int local_request_addfd_at(const struct kbox_supervisor_ctx *ctx,
-                                  uint64_t cookie,
-                                  int srcfd,
-                                  int target_fd,
-                                  uint32_t newfd_flags)
-{
-    (void) ctx;
-    (void) cookie;
-#ifdef __linux__
-    {
-        int ret = (int) kbox_syscall_trap_host_syscall6(
-            SYS_dup3, (uint64_t) srcfd, (uint64_t) target_fd,
-            (uint64_t) ((newfd_flags & O_CLOEXEC) ? O_CLOEXEC : 0), 0, 0, 0);
-        return ret >= 0 ? ret : -(int) -ret;
-    }
-#else
-    (void) srcfd;
-    (void) target_fd;
-    (void) newfd_flags;
-    return -ENOSYS;
-#endif
-}
-
-static const struct kbox_fd_inject_ops local_fd_inject_ops = {
-    .addfd = local_request_addfd,
-    .addfd_at = local_request_addfd_at,
 };
 
 static int find_available_tracee_fd(const struct kbox_supervisor_ctx *ctx,
@@ -1455,14 +1242,8 @@ void kbox_dispatch_prepare_request_ctx(struct kbox_supervisor_ctx *ctx,
         ctx->active_guest_mem.opaque = (uintptr_t) req->pid;
     }
     ctx->guest_mem_ops = ctx->active_guest_mem.ops;
-    if (!ctx->fd_inject_ops) {
-        if (req->source == KBOX_SYSCALL_SOURCE_TRAP ||
-            req->source == KBOX_SYSCALL_SOURCE_REWRITE) {
-            ctx->fd_inject_ops = &local_fd_inject_ops;
-        } else {
-            ctx->fd_inject_ops = &seccomp_fd_inject_ops;
-        }
-    }
+    if (!ctx->fd_inject_ops)
+        ctx->fd_inject_ops = &seccomp_fd_inject_ops;
     if (ctx->pending_reap) {
         ctx->pending_reap = 0;
         reap_dead_proc_fds(ctx);
@@ -10553,17 +10334,6 @@ static struct kbox_dispatch dispatch_request_impl(
      */
 
     if (nr == h->rt_sigaction) {
-        if (request_uses_trap_signals(req) &&
-            kbox_syscall_trap_signal_is_reserved(
-                (int) to_c_long_arg(kbox_syscall_request_arg(req, 0)))) {
-            if (ctx->verbose) {
-                fprintf(stderr,
-                        "kbox: reserved SIGSYS handler change denied "
-                        "(pid=%u source=%d)\n",
-                        kbox_syscall_request_pid(req), req->source);
-            }
-            return kbox_dispatch_errno(EPERM);
-        }
         {
             int signo = (int) to_c_long_arg(kbox_syscall_request_arg(req, 0));
             if (signo == 11 /* SIGSEGV */ || signo == 7 /* SIGBUS */)
@@ -10571,31 +10341,10 @@ static struct kbox_dispatch dispatch_request_impl(
         }
         return kbox_dispatch_continue();
     }
-    if (nr == h->rt_sigprocmask) {
-        if (request_uses_trap_signals(req)) {
-            long how = to_c_long_arg(kbox_syscall_request_arg(req, 0));
-            int blocks_reserved = request_blocks_reserved_sigsys(req, ctx);
-
-            if (blocks_reserved < 0)
-                return kbox_dispatch_errno(-blocks_reserved);
-            if (how != SIG_UNBLOCK && blocks_reserved) {
-                if (ctx->verbose) {
-                    fprintf(stderr,
-                            "kbox: reserved SIGSYS mask change denied "
-                            "(pid=%u source=%d how=%ld)\n",
-                            kbox_syscall_request_pid(req), req->source, how);
-                }
-                return kbox_dispatch_errno(EPERM);
-            }
-            return emulate_trap_rt_sigprocmask(req, ctx);
-        }
+    if (nr == h->rt_sigprocmask)
         return kbox_dispatch_continue();
-    }
-    if (nr == h->rt_sigpending) {
-        if (request_uses_trap_signals(req))
-            return emulate_trap_rt_sigpending(req, ctx);
+    if (nr == h->rt_sigpending)
         return kbox_dispatch_continue();
-    }
     /* rt_sigtimedwait waits on the tracee's own pending signals; the host
      * kernel owns those, so CONTINUE. ClickHouse's benchmark and client use
      * it to poll for SIGINT.
@@ -10658,9 +10407,6 @@ static struct kbox_dispatch dispatch_request_impl(
         long ret = syscall(SYS_kill, real, sig);
         if (ret < 0)
             return kbox_dispatch_errno(errno);
-        if (request_uses_trap_signals(req) && real == ctx->child_pid &&
-            trap_sigmask_contains_signal(sig))
-            (void) kbox_syscall_trap_add_pending_signal(sig);
         return kbox_dispatch_value(0);
     }
     if (nr == h->tgkill) {
@@ -10690,9 +10436,6 @@ static struct kbox_dispatch dispatch_request_impl(
         long ret = syscall(SYS_tgkill, real_tgid, real_tid, sig);
         if (ret < 0)
             return kbox_dispatch_errno(errno);
-        if (request_uses_trap_signals(req) && real_tid == caller_tid &&
-            trap_sigmask_contains_signal(sig))
-            (void) kbox_syscall_trap_add_pending_signal(sig);
         return kbox_dispatch_value(0);
     }
     if (nr == h->tkill) {
@@ -10703,10 +10446,6 @@ static struct kbox_dispatch dispatch_request_impl(
         long ret = syscall(SYS_tkill, real_tid, sig);
         if (ret < 0)
             return kbox_dispatch_errno(errno);
-        if (request_uses_trap_signals(req) &&
-            real_tid == kbox_syscall_request_pid(req) &&
-            trap_sigmask_contains_signal(sig))
-            (void) kbox_syscall_trap_add_pending_signal(sig);
         return kbox_dispatch_value(0);
     }
 #undef DENY_NON_GUEST
@@ -10716,28 +10455,8 @@ static struct kbox_dispatch dispatch_request_impl(
 
     /* arch_prctl: intercept SET_FS/GET_FS in trap/rewrite mode. */
 
-    if (nr == h->arch_prctl) {
-        if (request_uses_trap_signals(req)) {
-            long subcmd = to_c_long_arg(kbox_syscall_request_arg(req, 0));
-            if (subcmd == 0x1002 /* ARCH_SET_FS */) {
-                kbox_syscall_trap_set_guest_fs(
-                    kbox_syscall_request_arg(req, 1));
-                return kbox_dispatch_value(0);
-            }
-            if (subcmd == 0x1003 /* ARCH_GET_FS */) {
-                uint64_t out_ptr = kbox_syscall_request_arg(req, 1);
-                uint64_t fs = kbox_syscall_trap_get_guest_fs();
-                if (out_ptr == 0)
-                    return kbox_dispatch_errno(EFAULT);
-                int wrc = guest_mem_write(ctx, kbox_syscall_request_pid(req),
-                                          out_ptr, &fs, sizeof(fs));
-                if (wrc < 0)
-                    return kbox_dispatch_errno(-wrc);
-                return kbox_dispatch_value(0);
-            }
-        }
+    if (nr == h->arch_prctl)
         return kbox_dispatch_continue();
-    }
 
     /* clone: validate namespace and thread flags. */
 
@@ -10773,14 +10492,6 @@ static struct kbox_dispatch dispatch_request_impl(
             if (ctx->verbose)
                 fprintf(stderr, "kbox: clone: vfork parent recorded (pid=%d)\n",
                         (int) vp);
-        }
-        if ((cflags & CLONE_THREAD) && request_uses_trap_signals(req)) {
-            if (ctx->verbose)
-                fprintf(stderr,
-                        "kbox: clone denied: CLONE_THREAD in trap/rewrite mode "
-                        "(pid=%u, use --syscall-mode=seccomp)\n",
-                        kbox_syscall_request_pid(req));
-            return kbox_dispatch_errno(EPERM);
         }
 #ifndef CLONE_FILES
 #define CLONE_FILES 0x00000400

@@ -3,27 +3,6 @@
 #include "kbox/cli.h"
 #include "test-runner.h"
 
-/* On Linux, rewrite.c provides kbox_parse_syscall_mode.
- * On macOS (unit-test-only builds), provide a minimal stub. */
-#ifndef __linux__
-int kbox_parse_syscall_mode(const char *value, enum kbox_syscall_mode *out)
-{
-    if (!value || !out)
-        return -1;
-    if (strcmp(value, "auto") == 0)
-        *out = KBOX_SYSCALL_MODE_AUTO;
-    else if (strcmp(value, "seccomp") == 0)
-        *out = KBOX_SYSCALL_MODE_SECCOMP;
-    else if (strcmp(value, "trap") == 0)
-        *out = KBOX_SYSCALL_MODE_TRAP;
-    else if (strcmp(value, "rewrite") == 0)
-        *out = KBOX_SYSCALL_MODE_REWRITE;
-    else
-        return -1;
-    return 0;
-}
-#endif
-
 static void test_parse_args_partition_valid(void)
 {
     char *argv[] = {"kbox", "-r", "rootfs.ext4", "-p", "7"};

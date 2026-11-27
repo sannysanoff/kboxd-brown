@@ -2,9 +2,8 @@
 
 /* Exec, mmap, mprotect, and clone3 handlers for the seccomp dispatch engine.
  *
- * trap_userspace_exec performs in-process binary replacement for trap/rewrite
- * mode. forward_execve handles both seccomp-unotify pathname rewriting and
- * trap-mode userspace exec.
+ * forward_execve performs the seccomp-unotify pathname rewrite that lets the
+ * guest exec a file it can open but not otherwise name.
  */
 
 #include <errno.h>
@@ -23,13 +22,9 @@
 #include "dispatch-internal.h"
 #include "kbox/elf.h"
 #include "kbox/path.h"
-#include "loader-launch.h"
 #include "procmem.h"
-#include "rewrite.h"
 #include "shadow-fd.h"
 #include "syscall-nr.h"
-#include "syscall-trap-signal.h"
-#include "syscall-trap.h"
 
 /* AT_EMPTY_PATH flag for execveat: indicates fexecve() usage. Defined here to
  * avoid pulling in the full linux/fcntl.h.
@@ -43,24 +38,6 @@
 #define KBOX_EXEC_MAIN_LOAD_BIAS 0x600000000000ULL
 #define KBOX_EXEC_INTERP_LOAD_BIAS 0x610000000000ULL
 #define KBOX_EXEC_STACK_TOP 0x700000010000ULL
-
-/* Alternate stack region for userspace re-exec. During re-exec SIGSYS handler
- * is running on the old guest stack, so we cannot unmap it until after
- * transferring to the new binary. Place the new stack at a different address;
- * the old stack region is reclaimed by the subsequent munmap in
- * teardown_old_guest_mappings during the NEXT re-exec.
- */
-#define KBOX_EXEC_REEXEC_STACK_TOP 0x6F0000010000ULL
-
-/* Maximum entries in argv or envp for userspace exec. */
-#define KBOX_EXEC_MAX_ARGS 4096
-
-/* Track which stack region is in use by the current guest. The initial launch
- * uses KBOX_EXEC_STACK_TOP; re-exec alternates between the two addresses. The
- * signal handler runs on the current guest's stack, so we must not unmap it
- * during re-exec.
- */
-static uint64_t reexec_current_stack_top;
 
 static pid_t tracee_parent_of(pid_t pid)
 {
@@ -274,31 +251,6 @@ void kbox_guest_exe_set(struct kbox_supervisor_ctx *ctx,
 struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
                                   struct kbox_supervisor_ctx *ctx)
 {
-    /* W^X enforcement for mmap in trap/rewrite mode. */
-    if (request_uses_trap_signals(req)) {
-        int prot = (int) kbox_syscall_request_arg(req, 2);
-        int mmap_flags = (int) kbox_syscall_request_arg(req, 3);
-        long mmap_fd = to_dirfd_arg(kbox_syscall_request_arg(req, 4));
-        if ((prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)) {
-            if (ctx->verbose)
-                fprintf(stderr,
-                        "kbox: mmap denied: "
-                        "W^X violation (prot=0x%x, pid=%u)\n",
-                        prot, kbox_syscall_request_pid(req));
-            return kbox_dispatch_errno(EACCES);
-        }
-        if (mmap_fd != -1 && (mmap_flags & MAP_SHARED) != 0 &&
-            (prot & PROT_EXEC) != 0) {
-            if (ctx->verbose)
-                fprintf(stderr,
-                        "kbox: mmap denied: shared executable file mapping "
-                        "(prot=0x%x flags=0x%x fd=%ld pid=%u)\n",
-                        prot, mmap_flags, mmap_fd,
-                        kbox_syscall_request_pid(req));
-            return kbox_dispatch_errno(EACCES);
-        }
-    }
-
     long fd = to_dirfd_arg(kbox_syscall_request_arg(req, 4));
 
     if (fd == -1)
@@ -395,78 +347,12 @@ struct kbox_dispatch forward_mmap(const struct kbox_syscall_request *req,
     return kbox_dispatch_continue();
 }
 
-/* W^X enforcement for mprotect in trap/rewrite mode.
- *
- * Reject simultaneous PROT_WRITE|PROT_EXEC to prevent JIT spray attacks.
- * On writable->executable transitions in trap/rewrite mode, scan the promoted
- * region and fail closed if it contains syscall instructions.
- *
- * In seccomp mode, this is a no-op: CONTINUE lets the host kernel handle it.
- */
+/* mprotect needs no supervision: the host kernel applies it unchanged. */
 struct kbox_dispatch forward_mprotect(const struct kbox_syscall_request *req,
                                       struct kbox_supervisor_ctx *ctx)
 {
-    uint64_t addr = kbox_syscall_request_arg(req, 0);
-    uint64_t len = kbox_syscall_request_arg(req, 1);
-    int prot = (int) kbox_syscall_request_arg(req, 2);
-
-    /* In seccomp mode (supervisor), just pass through. */
-    if (!request_uses_trap_signals(req))
-        return kbox_dispatch_continue();
-
-    /* W^X enforcement: reject PROT_WRITE | PROT_EXEC. */
-    if ((prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)) {
-        if (ctx->verbose)
-            fprintf(stderr,
-                    "kbox: mprotect denied: W^X violation at 0x%llx len=%llu "
-                    "(pid=%u)\n",
-                    (unsigned long long) addr, (unsigned long long) len,
-                    kbox_syscall_request_pid(req));
-        return kbox_dispatch_errno(EACCES);
-    }
-
-    if ((prot & PROT_EXEC) != 0) {
-        int alias_rc = guest_range_has_shared_file_write_mapping(
-            kbox_syscall_request_pid(req), addr, len);
-        if (alias_rc < 0) {
-            if (ctx->verbose)
-                fprintf(stderr,
-                        "kbox: mprotect denied: cannot inspect shared "
-                        "mapping state at 0x%llx len=%llu (pid=%u)\n",
-                        (unsigned long long) addr, (unsigned long long) len,
-                        kbox_syscall_request_pid(req));
-            return kbox_dispatch_errno(EACCES);
-        }
-        if (alias_rc > 0) {
-            if (ctx->verbose)
-                fprintf(stderr,
-                        "kbox: mprotect denied: executable promotion of "
-                        "shared writable file mapping at 0x%llx len=%llu "
-                        "(pid=%u)\n",
-                        (unsigned long long) addr, (unsigned long long) len,
-                        kbox_syscall_request_pid(req));
-            return kbox_dispatch_errno(EACCES);
-        }
-        {
-            struct kbox_rewrite_runtime *runtime =
-                kbox_rewrite_runtime_active();
-
-            if (kbox_rewrite_runtime_promote_exec_region(runtime, addr, len) <
-                0) {
-                if (ctx->verbose)
-                    fprintf(stderr,
-                            "kbox: mprotect denied: scan-on-X failed at "
-                            "0x%llx len=%llu (pid=%u)\n",
-                            (unsigned long long) addr, (unsigned long long) len,
-                            kbox_syscall_request_pid(req));
-                return kbox_dispatch_errno(EACCES);
-            }
-        }
-    }
-
-    /* Clean pages can proceed. Pages with runtime-emitted syscall sites are
-     * denied by scan-on-X above.
-     */
+    (void) req;
+    (void) ctx;
     return kbox_dispatch_continue();
 }
 
@@ -517,9 +403,6 @@ struct kbox_dispatch forward_clone3(const struct kbox_syscall_request *req,
         fprintf(stderr, "kbox: clone3 pid=%u flags=%#llx\n",
                 kbox_syscall_request_pid(req), (unsigned long long) flags);
 
-    /* In trap/rewrite mode, block thread creation (CLONE_THREAD).
-     * Multi-threaded guests require --syscall-mode=seccomp.
-     */
     /* vfork. kbox performs an exec by rewriting the pathname in the tracee's
      * memory, which is unsafe for a child that shares the parent's address
      * space: the rewrite lands in the parent's stack, so after the child
@@ -541,15 +424,6 @@ struct kbox_dispatch forward_clone3(const struct kbox_syscall_request *req,
                     kbox_syscall_request_pid(req));
     }
 
-    if ((flags & CLONE_THREAD) && request_uses_trap_signals(req)) {
-        if (ctx->verbose)
-            fprintf(stderr,
-                    "kbox: clone3 denied: CLONE_THREAD in trap/rewrite mode "
-                    "(pid=%u, use --syscall-mode=seccomp)\n",
-                    kbox_syscall_request_pid(req));
-        return kbox_dispatch_errno(EPERM);
-    }
-
     /* Write the validated flags back to the guest's clone_args struct to
      * narrow the TOCTOU window: if a sibling thread mutated the flags between
      * our read and the host kernel's re-read, this overwrites the mutation.
@@ -569,469 +443,6 @@ struct kbox_dispatch forward_clone3(const struct kbox_syscall_request *req,
     if (!(flags & (CLONE_THREAD | CLONE_FILES)))
         kbox_dispatch_snapshot_fork(ctx, kbox_syscall_request_pid(req));
     return kbox_dispatch_continue();
-}
-
-/* Safely count a null-terminated pointer array in guest address space.
- * Uses process_vm_readv to avoid SIGSEGV on bad guest pointers.
- * Returns the count (not including the final NULL), or -EFAULT on bad memory.
- */
-static long count_user_ptrs_safe(uint64_t arr_addr, size_t max_count)
-{
-    size_t n = 0;
-    uint64_t ptr;
-
-    if (arr_addr == 0)
-        return -EFAULT;
-
-    while (n < max_count) {
-        uint64_t offset, probe_addr;
-        int rc;
-        if (__builtin_mul_overflow((uint64_t) n, sizeof(uint64_t), &offset) ||
-            __builtin_add_overflow(arr_addr, offset, &probe_addr))
-            return -EFAULT;
-        rc = kbox_current_read(probe_addr, &ptr, sizeof(ptr));
-        if (rc < 0)
-            return -EFAULT;
-        if (ptr == 0)
-            return (long) n;
-        n++;
-    }
-
-    return -E2BIG;
-}
-
-/* Safely measure the length of a guest string.
- * Returns the length (not including NUL), or -EFAULT on bad memory.
- */
-static long strlen_user_safe(uint64_t str_addr)
-{
-    char buf[256];
-    size_t total = 0;
-
-    if (str_addr == 0)
-        return -EFAULT;
-
-    for (;;) {
-        int rc = kbox_current_read(str_addr + total, buf, sizeof(buf));
-        if (rc < 0)
-            return -EFAULT;
-        for (size_t i = 0; i < sizeof(buf); i++) {
-            if (buf[i] == '\0')
-                return (long) (total + i);
-        }
-        total += sizeof(buf);
-        if (total > (size_t) (256 * 1024))
-            return -ENAMETOOLONG;
-    }
-}
-
-/* Safely read a single guest pointer (8 bytes). */
-static int read_user_ptr(uint64_t addr, uint64_t *out)
-{
-    return kbox_current_read(addr, out, sizeof(*out));
-}
-
-/* Safely copy a guest string into a destination buffer.
- * Returns the string length (not including NUL), or -EFAULT.
- */
-static long copy_user_string(uint64_t str_addr, char *dst, size_t dst_size)
-{
-    return kbox_current_read_string(str_addr, dst, dst_size);
-}
-
-/* Tear down old guest code/data mappings and the stale stack at the
- * new stack address.  The current guest stack (which the SIGSYS
- * handler is running on) is at the OTHER address and left alone.
- * It leaks one stack-sized region until the next re-exec cycle.
- */
-static void teardown_old_guest_mappings(uint64_t new_stack_top)
-{
-    /* Main binary region: up to 256 MB from the load bias. */
-    munmap((void *) (uintptr_t) KBOX_EXEC_MAIN_LOAD_BIAS, 256UL * 1024 * 1024);
-    /* Interpreter region: up to 256 MB from the load bias. */
-    munmap((void *) (uintptr_t) KBOX_EXEC_INTERP_LOAD_BIAS,
-           256UL * 1024 * 1024);
-    /* Unmap any stale stack at the new stack address.  On the first
-     * re-exec (new = REEXEC), this is a no-op (nothing mapped there).
-     * On the second re-exec (new = STACK_TOP), this unmaps the
-     * initial launch stack.  Subsequent cycles alternate and reclaim.
-     */
-    munmap((void *) (uintptr_t) (new_stack_top - 16UL * 1024 * 1024),
-           16UL * 1024 * 1024 + 0x10000UL);
-}
-
-/* Perform userspace exec for trap mode.  Called from inside the SIGSYS
- * handler when the guest calls execve/execveat.  This replaces the
- * current process image without a real exec syscall, preserving the
- * SIGSYS handler and seccomp filter chain.
- *
- * The function is noreturn on success: it transfers control to the new
- * binary's entry point.  On failure, it returns a dispatch with errno.
- */
-static struct kbox_dispatch trap_userspace_exec(
-    const struct kbox_syscall_request *req,
-    struct kbox_supervisor_ctx *ctx,
-    int exec_memfd,
-    const char *pathname,
-    int is_execveat)
-{
-    unsigned char *elf_buf = NULL;
-    size_t elf_buf_len = 0;
-    char interp_path[256];
-    int interp_memfd = -1;
-    int ilen = 0;
-    struct kbox_loader_launch_spec spec;
-    struct kbox_loader_launch launch = {0};
-    struct kbox_syscall_trap_ip_range ranges[KBOX_LOADER_MAX_MAPPINGS];
-    struct kbox_loader_exec_range exec_ranges[KBOX_LOADER_MAX_MAPPINGS];
-    size_t exec_count = 0;
-    size_t range_count = 0;
-    unsigned char random_bytes[KBOX_LOADER_RANDOM_SIZE];
-
-    /* execve(path, argv, envp): argv=args[1], envp=args[2]
-     * execveat(dirfd, path, argv, envp, flags): argv=args[2], envp=args[3]
-     *
-     * In trap mode these are guest pointers in our address space, but still
-     * guest-controlled.  All accesses must use safe reads (process_vm_readv)
-     * so bad pointers yield -EFAULT instead of crashing the SIGSYS handler.
-     */
-    uint64_t argv_addr = kbox_syscall_request_arg(req, is_execveat ? 2 : 1);
-    uint64_t envp_addr = kbox_syscall_request_arg(req, is_execveat ? 3 : 2);
-    long argc_long = count_user_ptrs_safe(argv_addr, KBOX_EXEC_MAX_ARGS);
-    long envc_long = count_user_ptrs_safe(envp_addr, KBOX_EXEC_MAX_ARGS);
-    size_t argc, envc;
-
-    if (argc_long < 0) {
-        close(exec_memfd);
-        return kbox_dispatch_errno(argc_long == -E2BIG ? EINVAL : EFAULT);
-    }
-    if (envc_long < 0) {
-        close(exec_memfd);
-        return kbox_dispatch_errno(envc_long == -E2BIG ? EINVAL : EFAULT);
-    }
-    argc = (size_t) argc_long;
-    envc = (size_t) envc_long;
-    if (argc == 0) {
-        close(exec_memfd);
-        return kbox_dispatch_errno(EINVAL);
-    }
-
-    /* Deep-copy argv and envp into a single mmap'd arena. Using mmap instead of
-     * malloc/strdup because we are inside the SIGSYS handler and glibc's
-     * allocator is not async-signal-safe.
-     *
-     * Two passes: first measure total size (via safe string length reads), then
-     * copy. All guest pointer reads use process_vm_readv.
-     */
-    size_t arena_size = (argc + envc) * sizeof(char *);
-    for (size_t i = 0; i < argc; i++) {
-        uint64_t str_addr;
-        long slen;
-        if (read_user_ptr(argv_addr + i * sizeof(uint64_t), &str_addr) < 0) {
-            close(exec_memfd);
-            return kbox_dispatch_errno(EFAULT);
-        }
-        slen = strlen_user_safe(str_addr);
-        if (slen < 0) {
-            close(exec_memfd);
-            return kbox_dispatch_errno(EFAULT);
-        }
-        arena_size += (size_t) slen + 1;
-    }
-    for (size_t i = 0; i < envc; i++) {
-        uint64_t str_addr;
-        long slen;
-        if (read_user_ptr(envp_addr + i * sizeof(uint64_t), &str_addr) < 0) {
-            close(exec_memfd);
-            return kbox_dispatch_errno(EFAULT);
-        }
-        slen = strlen_user_safe(str_addr);
-        if (slen < 0) {
-            close(exec_memfd);
-            return kbox_dispatch_errno(EFAULT);
-        }
-        arena_size += (size_t) slen + 1;
-    }
-    arena_size = (arena_size + 4095) & ~(size_t) 4095;
-
-    char *arena = mmap(NULL, arena_size, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (arena == MAP_FAILED) {
-        close(exec_memfd);
-        return kbox_dispatch_errno(ENOMEM);
-    }
-    size_t arena_used = 0;
-    char **argv_copy = (char **) (arena + arena_used);
-    arena_used += argc * sizeof(char *);
-    char **envp_copy = (char **) (arena + arena_used);
-    arena_used += envc * sizeof(char *);
-    for (size_t i = 0; i < argc; i++) {
-        uint64_t str_addr;
-        long slen;
-        if (read_user_ptr(argv_addr + i * sizeof(uint64_t), &str_addr) < 0)
-            goto fail_arena;
-        slen = copy_user_string(str_addr, arena + arena_used,
-                                arena_size - arena_used);
-        if (slen < 0)
-            goto fail_arena;
-        argv_copy[i] = arena + arena_used;
-        arena_used += (size_t) slen + 1;
-    }
-    for (size_t i = 0; i < envc; i++) {
-        uint64_t str_addr;
-        long slen;
-        if (read_user_ptr(envp_addr + i * sizeof(uint64_t), &str_addr) < 0)
-            goto fail_arena;
-        slen = copy_user_string(str_addr, arena + arena_used,
-                                arena_size - arena_used);
-        if (slen < 0)
-            goto fail_arena;
-        envp_copy[i] = arena + arena_used;
-        arena_used += (size_t) slen + 1;
-    }
-
-    /* Check for PT_INTERP (dynamic binary needing an interpreter). */
-    if (kbox_read_elf_header_window_fd(exec_memfd, &elf_buf, &elf_buf_len) ==
-        0) {
-        uint64_t pt_offset, pt_filesz;
-
-        ilen = kbox_find_elf_interp_loc(elf_buf, elf_buf_len, interp_path,
-                                        sizeof(interp_path), &pt_offset,
-                                        &pt_filesz);
-        munmap(elf_buf, elf_buf_len);
-        elf_buf = NULL;
-
-        if (ilen < 0) {
-            ilen = -ENOEXEC;
-            goto fail_early;
-        }
-
-        if (ilen > 0) {
-            long interp_lkl = kbox_lkl_openat(ctx->sysnrs, AT_FDCWD_LINUX,
-                                              interp_path, O_RDONLY, 0);
-            if (interp_lkl < 0) {
-                if (ctx->verbose)
-                    fprintf(stderr,
-                            "kbox: trap exec %s: cannot open "
-                            "interpreter %s: %s\n",
-                            pathname, interp_path, kbox_err_text(interp_lkl));
-                ilen = (int) interp_lkl;
-                goto fail_early;
-            }
-
-            interp_memfd = kbox_shadow_create_resilient(ctx, interp_lkl);
-            lkl_close_and_invalidate(ctx, interp_lkl);
-
-            if (interp_memfd < 0) {
-                ilen = interp_memfd;
-                goto fail_early;
-            }
-        }
-    }
-    /* else: kbox_read_elf_header_window_fd failed, elf_buf is still NULL.
-     * Nothing to unmap. Treat as static binary (no interpreter).
-     */
-
-    /* Generate random bytes for AT_RANDOM auxv entry. Use the raw syscall to
-     * avoid depending on sys/random.h availability.
-     */
-    memset(random_bytes, 0x42, sizeof(random_bytes));
-#ifdef __NR_getrandom
-    {
-        long gr =
-            syscall(__NR_getrandom, random_bytes, sizeof(random_bytes), 0);
-        (void) gr;
-    }
-#endif
-
-    /* Pick a stack address that does not collide with old guest stack (which we
-     * are currently running on from inside the SIGSYS handler).
-     * Alternate between two stack tops so the old one survives until the next
-     * re-exec reclaims it.
-     */
-    uint64_t new_stack_top =
-        (reexec_current_stack_top == KBOX_EXEC_REEXEC_STACK_TOP)
-            ? KBOX_EXEC_STACK_TOP
-            : KBOX_EXEC_REEXEC_STACK_TOP;
-
-    /* Build the loader launch spec. Use the same load biases as initial launch
-     * so the address space layout is consistent.
-     */
-    memset(&spec, 0, sizeof(spec));
-    spec.exec_fd = exec_memfd;
-    spec.interp_fd = interp_memfd;
-    spec.argv = (const char *const *) argv_copy;
-    spec.argc = argc;
-    spec.envp = (const char *const *) envp_copy;
-    spec.envc = envc;
-    spec.execfn = pathname;
-    spec.random_bytes = random_bytes;
-    spec.page_size = (uint64_t) sysconf(_SC_PAGESIZE);
-    spec.stack_top = new_stack_top;
-    spec.main_load_bias = KBOX_EXEC_MAIN_LOAD_BIAS;
-    spec.interp_load_bias = KBOX_EXEC_INTERP_LOAD_BIAS;
-    spec.uid = ctx->root_identity ? 0 : (uint32_t) getuid();
-    spec.euid = ctx->root_identity ? 0 : (uint32_t) getuid();
-    spec.gid = ctx->root_identity ? 0 : (uint32_t) getgid();
-    spec.egid = ctx->root_identity ? 0 : (uint32_t) getgid();
-    spec.secure = 0;
-
-    /* Tear down old guest code/data mappings BEFORE materializing new ones
-     * (MAP_FIXED_NOREPLACE requires the addresses to be free). But do NOT
-     * teardown before reading the memfds; the reads use pread which doesn't
-     * depend on the old mappings.
-     */
-    teardown_old_guest_mappings(new_stack_top);
-
-    {
-        int launch_rc = kbox_loader_prepare_launch(&spec, &launch);
-        if (launch_rc < 0) {
-            const char msg[] = "kbox: trap exec: loader prepare failed\n";
-            ssize_t n = write(STDERR_FILENO, msg, sizeof(msg) - 1);
-            (void) n;
-            _exit(127);
-        }
-    }
-
-    /* The memfds have been read into launch buffers; close them. */
-    close(exec_memfd);
-    if (interp_memfd >= 0)
-        close(interp_memfd);
-
-    /* Collect executable ranges from the new layout for the BPF filter. The new
-     * filter is appended to the filter chain; old filter is harmless (matches
-     * unmapped addresses).
-     */
-    if (kbox_loader_collect_exec_ranges(
-            &launch, exec_ranges, KBOX_LOADER_MAX_MAPPINGS, &exec_count) < 0) {
-        if (ctx->verbose)
-            fprintf(stderr, "kbox: trap exec %s: cannot collect exec ranges\n",
-                    pathname);
-        kbox_loader_launch_reset(&launch);
-        _exit(127);
-    }
-    for (size_t i = 0; i < exec_count; i++) {
-        ranges[i].start = (uintptr_t) exec_ranges[i].start;
-        ranges[i].end = (uintptr_t) exec_ranges[i].end;
-    }
-    range_count = exec_count;
-
-    /* Install a new BPF RET_TRAP filter covering the new binary's executable
-     * ranges. seccomp filters form a chain; calling seccomp(SET_MODE_FILTER)
-     * adds to it rather than replacing.
-     */
-    if (kbox_install_seccomp_trap_ranges(ctx->host_nrs, ranges, range_count) <
-        0) {
-        if (ctx->verbose)
-            fprintf(stderr,
-                    "kbox: trap exec %s: cannot install new BPF filter\n",
-                    pathname);
-        kbox_loader_launch_reset(&launch);
-        _exit(127);
-    }
-
-    /* Clean up CLOEXEC entries from the FD table, matching what a
-     * real exec would do.
-     */
-    close_cloexec_with_writeback(ctx);
-
-    /* If the original launch used rewrite mode, re-apply binary rewriting to
-     * the new binary. This patches syscall instructions in the newly loaded
-     * executable segments and sets up trampoline regions, promoting the new
-     * binary from Tier 1 (SIGSYS ~3us) to Tier 2 (~41ns) for rewritten sites.
-     *
-     * If rewrite installation fails (e.g., trampoline allocation), the binary
-     * still works correctly via the SIGSYS handler (Tier 1).
-     */
-    if (req->source == KBOX_SYSCALL_SOURCE_REWRITE) {
-        /* Static: runtime is stored globally via store_active_rewrite_runtime
-         * and must survive past the noreturn transfer_to_guest. Single-threaded
-         * trap mode guarantees no concurrent re-exec.
-         */
-        static struct kbox_rewrite_runtime rewrite_rt;
-        kbox_rewrite_runtime_reset(&rewrite_rt);
-        if (kbox_rewrite_runtime_install(&rewrite_rt, ctx, &launch) == 0) {
-            if (ctx->verbose)
-                fprintf(stderr,
-                        "kbox: trap exec %s: rewrite installed "
-                        "(%zu trampoline regions)\n",
-                        pathname, rewrite_rt.trampoline_region_count);
-        } else {
-            if (ctx->verbose)
-                fprintf(stderr,
-                        "kbox: trap exec %s: rewrite failed, "
-                        "falling back to SIGSYS\n",
-                        pathname);
-        }
-    }
-
-#if defined(__x86_64__)
-    /* Reset the guest FS base to the host (kbox) FS base. We are inside the
-     * SIGSYS handler where FS already points to kbox's TLS. The new binary
-     * starts with no TLS set up; it will call arch_prctl(ARCH_SET_FS) during
-     * libc init to establish its own. Until then, SIGSYS handler entry should
-     * see FS == host FS and the save/restore becomes a no-op, which is correct.
-     */
-    {
-        uint64_t host_fs = 0;
-
-        kbox_syscall_trap_host_arch_prctl_get_fs(&host_fs);
-        kbox_syscall_trap_set_guest_fs(host_fs);
-    }
-#endif
-
-    if (ctx->verbose)
-        fprintf(stderr,
-                "kbox: trap exec %s: transferring to new image "
-                "pc=0x%llx sp=0x%llx\n",
-                pathname, (unsigned long long) launch.transfer.pc,
-                (unsigned long long) launch.transfer.sp);
-
-    /* Record which stack the new guest is using. The next re-exec will pick the
-     * other address and reclaim this one.
-     */
-    reexec_current_stack_top = new_stack_top;
-
-    /* Free staging buffers before transferring. The image regions (mmap'd guest
-     * code/data/stack) must survive.
-     */
-    munmap(arena, arena_size);
-    if (launch.main_elf && launch.main_elf_len > 0)
-        munmap(launch.main_elf, launch.main_elf_len);
-    launch.main_elf = NULL;
-    if (launch.interp_elf && launch.interp_elf_len > 0)
-        munmap(launch.interp_elf, launch.interp_elf_len);
-    launch.interp_elf = NULL;
-    kbox_loader_stack_image_reset(&launch.layout.stack);
-
-    /* Unblock SIGSYS before transferring. We are inside the SIGSYS handler,
-     * which runs with SIGSYS blocked (SA_SIGINFO default).
-     * Since we jump to the new entry point instead of returning from the
-     * handler, the kernel never restores the pre-handler signal mask. The new
-     * binary needs SIGSYS unblocked so the BPF RET_TRAP filter can deliver it.
-     */
-    {
-        uint64_t mask[2] = {0, 0};
-        unsigned int signo = SIGSYS - 1;
-        mask[signo / 64] = 1ULL << (signo % 64);
-        kbox_syscall_trap_host_rt_sigprocmask_unblock(mask,
-                                                      8 /* kernel sigset_t */);
-    }
-
-    /* Transfer control to the new binary.  This is noreturn. */
-    kbox_loader_transfer_to_guest(&launch.transfer);
-
-fail_arena:
-    munmap(arena, arena_size);
-    close(exec_memfd);
-    return kbox_dispatch_errno(EFAULT);
-
-fail_early:
-    munmap(arena, arena_size);
-    close(exec_memfd);
-    if (interp_memfd >= 0)
-        close(interp_memfd);
-    return kbox_dispatch_errno((int) (-ilen));
 }
 
 /* Handle execve/execveat from inside the image.
@@ -2408,14 +1819,6 @@ static struct kbox_dispatch forward_execve_impl(
 
     if (exec_memfd < 0)
         return kbox_dispatch_errno(-exec_memfd);
-
-    /* Trap mode: the SIGSYS handler and BPF filter do not survive a real exec,
-     * so perform a userspace exec instead. This replaces the process image
-     * in-place (unmap old, map new, jump to entry) without invoking kernel's
-     * execve. On success the function does not return.
-     */
-    if (request_uses_trap_signals(req))
-        return trap_userspace_exec(req, ctx, exec_memfd, pathbuf, is_execveat);
 
     int exec_fd_cloexec = O_CLOEXEC;
     rc = prepare_exec_image(ctx, req, &exec_memfd, pathbuf, &exec_fd_cloexec);

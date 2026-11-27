@@ -27,8 +27,7 @@ struct kbox_probe_result {
  * Returns 0 on success, -1 if a required feature is unavailable.
  * Prints diagnostics to stderr.
  */
-int kbox_probe_host_features(enum kbox_syscall_mode mode);
-int kbox_collect_probe_result(enum kbox_syscall_mode mode,
-                              struct kbox_probe_result *out);
+int kbox_probe_host_features(void);
+int kbox_collect_probe_result(struct kbox_probe_result *out);
 
 #endif /* KBOX_PROBE_H */

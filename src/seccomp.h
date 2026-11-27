@@ -13,7 +13,6 @@
 #include "procmem.h"
 #include "seccomp-defs.h"
 #include "syscall-nr.h"
-#include "syscall-trap-signal.h"
 
 struct kbox_dispatch {
     enum {
@@ -54,10 +53,9 @@ struct kbox_literal_path_cache_entry {
     char translated[KBOX_MAX_PATH];
 };
 
+/* Every request arrives through the seccomp user-notification listener. */
 enum kbox_syscall_source {
     KBOX_SYSCALL_SOURCE_SECCOMP = 0,
-    KBOX_SYSCALL_SOURCE_TRAP,
-    KBOX_SYSCALL_SOURCE_REWRITE,
 };
 
 struct kbox_syscall_regs {
@@ -393,15 +391,6 @@ struct kbox_supervisor_ctx {
 };
 
 int kbox_install_seccomp_listener(const struct kbox_host_nrs *h);
-int kbox_install_seccomp_trap(const struct kbox_host_nrs *h);
-int kbox_install_seccomp_trap_ranges(
-    const struct kbox_host_nrs *h,
-    const struct kbox_syscall_trap_ip_range *trap_ranges,
-    size_t trap_range_count);
-int kbox_install_seccomp_rewrite_ranges(
-    const struct kbox_host_nrs *h,
-    const struct kbox_syscall_trap_ip_range *trap_ranges,
-    size_t trap_range_count);
 int kbox_notify_recv(int listener_fd, void *notif);
 int kbox_notify_send(int listener_fd, const void *resp);
 int kbox_notify_respond(int listener_fd,

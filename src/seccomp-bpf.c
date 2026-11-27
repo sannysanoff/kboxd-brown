@@ -33,7 +33,6 @@
 #include "fd-table.h"
 #include "kbox/compiler.h"
 #include "seccomp.h"
-#include "syscall-trap-signal.h"
 
 /* Deny list: arch-specific syscall numbers. */
 
@@ -293,94 +292,8 @@ static void emit_self_pid_allow(struct kbox_sock_filter *filter,
         KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
 }
 
-static int emit_ip_range_allow(struct kbox_sock_filter *filter,
-                               int *idx,
-                               const struct kbox_syscall_trap_ip_range *range)
-{
-    uint64_t start;
-    uint64_t end_inclusive;
-    uint32_t hi;
-    uint32_t lo_start;
-    uint32_t lo_end;
-
-    if (!filter || !idx || !range || range->start >= range->end)
-        return -1;
-
-    start = (uint64_t) range->start;
-    end_inclusive = (uint64_t) range->end - 1;
-    if ((start >> 32) != (end_inclusive >> 32))
-        return -1;
-
-    hi = (uint32_t) (start >> 32);
-    lo_start = (uint32_t) start;
-    lo_end = (uint32_t) end_inclusive;
-
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS,
-        KBOX_SECCOMP_DATA_IP_HI_OFFSET);
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, hi, 0, 4);
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS,
-        KBOX_SECCOMP_DATA_IP_LO_OFFSET);
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_JGE | KBOX_BPF_K, lo_start, 0, 2);
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_JGT | KBOX_BPF_K, lo_end, 1, 0);
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
-    return 0;
-}
-
-static int emit_ip_range_trap_match(
-    struct kbox_sock_filter *filter,
-    int *idx,
-    const struct kbox_syscall_trap_ip_range *range,
-    int *jump_index_out)
-{
-    uint64_t start;
-    uint64_t end_inclusive;
-    uint32_t hi;
-    uint32_t lo_start;
-    uint32_t lo_end;
-
-    if (!filter || !idx || !range || !jump_index_out ||
-        range->start >= range->end)
-        return -1;
-
-    start = (uint64_t) range->start;
-    end_inclusive = (uint64_t) range->end - 1;
-    if ((start >> 32) != (end_inclusive >> 32))
-        return -1;
-
-    hi = (uint32_t) (start >> 32);
-    lo_start = (uint32_t) start;
-    lo_end = (uint32_t) end_inclusive;
-
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS,
-        KBOX_SECCOMP_DATA_IP_HI_OFFSET);
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, hi, 0, 4);
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS,
-        KBOX_SECCOMP_DATA_IP_LO_OFFSET);
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_JGE | KBOX_BPF_K, lo_start, 0, 2);
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_JGT | KBOX_BPF_K, lo_end, 1, 0);
-    *jump_index_out = *idx;
-    filter[(*idx)++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_K, 0, 0, 0);
-    return 0;
-}
-
-static int install_seccomp_filter(
-    const struct kbox_host_nrs *h,
-    unsigned int default_action,
-    unsigned int filter_flags,
-    const struct kbox_syscall_trap_ip_range *allow_ranges,
-    size_t allow_range_count)
+static int install_seccomp_filter(const struct kbox_host_nrs *h,
+                                  unsigned int filter_flags)
 {
     struct kbox_sock_filter filter[MAX_PROG_LEN];
     struct kbox_sock_fprog prog;
@@ -400,15 +313,6 @@ static int install_seccomp_filter(
     /* [2] Wrong arch: kill. */
     filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
         KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_KILL_PROCESS);
-
-    if (allow_ranges) {
-        for (size_t r = 0; r < allow_range_count; r++) {
-            if (emit_ip_range_allow(filter, &idx, &allow_ranges[r]) < 0) {
-                errno = EINVAL;
-                return -1;
-            }
-        }
-    }
 
     /* Load syscall number. */
     filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
@@ -472,7 +376,7 @@ static int install_seccomp_filter(
      * create the pair removes the notification entirely; the descriptors are
      * closed in the kernel too, by the rule above.
      */
-    if (default_action == KBOX_SECCOMP_RET_USER_NOTIF) {
+    {
         if (h->pipe >= 0) {
             filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
                 KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K,
@@ -573,11 +477,9 @@ static int install_seccomp_filter(
      * guest then keeps its old mask. Measured in the guest: a shell that lost
      * a SIG_SETMASK stayed with SIGCHLD blocked, its child exited into a
      * zombie, SIGCHLD sat pending in the shared set, and "wait $pid" hung in
-     * sigsuspend forever. Trap mode emulates this call to keep the reserved
-     * SIGSYS unblocked, so it stays notified there.
+     * sigsuspend forever.
      */
-    if (default_action == KBOX_SECCOMP_RET_USER_NOTIF)
-        EMIT_CONTINUE_ALLOW(rt_sigprocmask);
+    EMIT_CONTINUE_ALLOW(rt_sigprocmask);
     EMIT_CONTINUE_ALLOW(setitimer);
     EMIT_CONTINUE_ALLOW(getitimer);
     EMIT_CONTINUE_ALLOW(set_tid_address);
@@ -631,7 +533,7 @@ static int install_seccomp_filter(
 
     /* Default: everything else goes to the supervisor. */
     filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_RET | KBOX_BPF_K, default_action);
+        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_USER_NOTIF);
 
     if (idx > MAX_PROG_LEN) {
         fprintf(stderr, "kbox: BPF program overflow (%d > %d)\n", idx,
@@ -664,11 +566,9 @@ int kbox_install_seccomp_listener(const struct kbox_host_nrs *h)
      * wait, and the guest sees EINTR from a call a real kernel never fails.
      * Kernel 6.4 and later have it; an older host is refused rather than run
      * with semantics that lose syscalls. */
-    int fd =
-        install_seccomp_filter(h, KBOX_SECCOMP_RET_USER_NOTIF,
-                               KBOX_SECCOMP_FILTER_FLAG_NEW_LISTENER |
-                                   KBOX_SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
-                               NULL, 0);
+    int fd = install_seccomp_filter(
+        h, KBOX_SECCOMP_FILTER_FLAG_NEW_LISTENER |
+               KBOX_SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV);
 
     if (fd < 0 && (errno == EINVAL || errno == ENOSYS)) {
         int saved = errno;
@@ -681,212 +581,4 @@ int kbox_install_seccomp_listener(const struct kbox_host_nrs *h)
         errno = ENOTSUP;
     }
     return fd;
-}
-
-int kbox_install_seccomp_trap(const struct kbox_host_nrs *h)
-{
-    struct kbox_syscall_trap_ip_range allow_range;
-
-    if (kbox_syscall_trap_host_syscall_range(&allow_range) < 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    return install_seccomp_filter(h, KBOX_SECCOMP_RET_TRAP, 0, &allow_range, 1);
-}
-
-/* A successful seccomp install returns into userspace with the filter already
- * active. Keep this return path free of sanitizer/runtime syscalls so the
- * launch code can branch straight into the guest.
- */
-__attribute__((no_stack_protector))
-#if KBOX_HAS_ASAN
-__attribute__((no_sanitize("address")))
-#endif
-__attribute__((no_sanitize("undefined"))) static int
-install_seccomp_trap_ranges_ex(
-    const struct kbox_host_nrs *h,
-    const struct kbox_syscall_trap_ip_range *trap_ranges,
-    size_t trap_range_count)
-{
-    struct kbox_sock_filter filter[MAX_PROG_LEN];
-    struct kbox_sock_fprog prog;
-    int match_jumps[MAX_IP_RANGE_COUNT];
-    struct kbox_syscall_trap_ip_range internal_ranges[16];
-    int internal_jumps[16];
-    size_t internal_count = 0;
-    int idx = 0;
-    int internal_allow_idx = -1;
-    int nr_load_idx;
-    int i;
-    long ret;
-
-    if (!h || !trap_ranges || trap_range_count == 0 ||
-        trap_range_count > MAX_IP_RANGE_COUNT) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (kbox_syscall_trap_internal_ip_ranges(
-            internal_ranges,
-            sizeof(internal_ranges) / sizeof(internal_ranges[0]),
-            &internal_count) < 0) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS, KBOX_SECCOMP_DATA_ARCH_OFFSET);
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, KBOX_AUDIT_ARCH_CURRENT, 1,
-        0);
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_KILL_PROCESS);
-
-    /* The kernel's signal restorer may live outside guest exec mappings.
-     * Allow rt_sigreturn before the IP gate so SIGSYS delivery can unwind
-     * without reopening general host-IP syscall execution.
-     */
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS, KBOX_SECCOMP_DATA_NR_OFFSET);
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K,
-        (unsigned int) h->rt_sigreturn, 0, 1);
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
-
-    for (i = 0; i < (int) internal_count; i++) {
-        if (emit_ip_range_trap_match(filter, &idx, &internal_ranges[i],
-                                     &internal_jumps[i]) < 0) {
-            errno = EINVAL;
-            return -1;
-        }
-    }
-
-    for (i = 0; i < (int) trap_range_count; i++) {
-        if (emit_ip_range_trap_match(filter, &idx, &trap_ranges[i],
-                                     &match_jumps[i]) < 0) {
-            errno = EINVAL;
-            return -1;
-        }
-    }
-
-    /* Non-guest, non-trampoline IPs must not reach the host kernel.
-     *
-     * The dedicated host trampoline covers the small set of syscalls kbox
-     * executes on the trapped guest thread. Guest executable mappings are
-     * matched above and routed into the dispatcher path. Any other IP is
-     * outside the permitted syscall origin set and is rejected.
-     */
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ERRNO(EPERM));
-
-    internal_allow_idx = idx;
-    for (i = 0; i < (int) internal_count; i++) {
-        int rel = internal_allow_idx - (internal_jumps[i] + 1);
-
-        if (rel < 0) {
-            errno = EINVAL;
-            return -1;
-        }
-        filter[internal_jumps[i]].k = (unsigned int) rel;
-    }
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
-
-    nr_load_idx = idx;
-    for (i = 0; i < (int) trap_range_count; i++) {
-        int rel = nr_load_idx - (match_jumps[i] + 1);
-
-        if (rel < 0) {
-            errno = EINVAL;
-            return -1;
-        }
-        filter[match_jumps[i]].k = (unsigned int) rel;
-    }
-
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS, KBOX_SECCOMP_DATA_NR_OFFSET);
-
-#define EMIT_ALLOW(nr)                                             \
-    do {                                                           \
-        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(   \
-            KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, (nr), 0, 1); \
-        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(   \
-            KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);    \
-    } while (0)
-
-    /* sendmsg bypasses the supervisor only for the handshake call. */
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, (h->sendmsg), 0, 4);
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS,
-        KBOX_SECCOMP_DATA_ARG2_LO_OFFSET);
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-        KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K, KBOX_SENDMSG_HANDSHAKE_FLAG,
-        0, 1);
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ALLOW);
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_LD | KBOX_BPF_W | KBOX_BPF_ABS, KBOX_SECCOMP_DATA_NR_OFFSET);
-    EMIT_ALLOW(h->exit);
-    EMIT_ALLOW(h->rt_sigreturn);
-#undef EMIT_ALLOW
-
-    /* Trap mode emulates the fd calls itself, so it keeps its own range
-     * checks: no supervisor runs there to consult the table. */
-
-    for (i = 0; i < DENY_COUNT; i++) {
-        if (deny_nrs[i] < 0)
-            continue;
-        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-            KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K,
-            (unsigned int) deny_nrs[i], 0, 1);
-        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-            KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ERRNO(EPERM));
-    }
-    for (i = 0; i < ENOSYS_COUNT; i++) {
-        if (enosys_nrs[i] < 0)
-            continue;
-        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_JUMP(
-            KBOX_BPF_JMP | KBOX_BPF_JEQ | KBOX_BPF_K,
-            (unsigned int) enosys_nrs[i], 0, 1);
-        filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-            KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_ERRNO(ENOSYS));
-    }
-
-    filter[idx++] = (struct kbox_sock_filter) KBOX_BPF_STMT(
-        KBOX_BPF_RET | KBOX_BPF_K, KBOX_SECCOMP_RET_TRAP);
-
-    if (idx > MAX_PROG_LEN) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    prog.len = (unsigned short) idx;
-    prog.filter = filter;
-
-    ret = syscall(__NR_seccomp, KBOX_SECCOMP_SET_MODE_FILTER, 0, &prog);
-    if (ret < 0) {
-        fprintf(stderr,
-                "kbox: seccomp(SET_MODE_FILTER, trap ranges) failed: %s\n",
-                strerror(errno));
-        return -1;
-    }
-
-    return (int) ret;
-}
-
-int kbox_install_seccomp_trap_ranges(
-    const struct kbox_host_nrs *h,
-    const struct kbox_syscall_trap_ip_range *trap_ranges,
-    size_t trap_range_count)
-{
-    return install_seccomp_trap_ranges_ex(h, trap_ranges, trap_range_count);
-}
-
-int kbox_install_seccomp_rewrite_ranges(
-    const struct kbox_host_nrs *h,
-    const struct kbox_syscall_trap_ip_range *trap_ranges,
-    size_t trap_range_count)
-{
-    return install_seccomp_trap_ranges_ex(h, trap_ranges, trap_range_count);
 }
