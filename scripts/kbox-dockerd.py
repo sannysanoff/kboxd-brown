@@ -1318,30 +1318,36 @@ class DockerEngineState:
         Published volumes carry Mountpoint=nfs://... and Driver=kbox-nfs so the
         mount path is never confused with a local directory: a container that
         binds one must go through the daemon's NFS path, not a host path.
+
+        A mount that declares `sub:` is published TWICE: the bare handle, and
+        handle/sub. The second is the name the system stack asks for (this pod's
+        own home), and compose only accepts an external volume it finds in this
+        list — so publishing the bare handle alone left the agent stack failing
+        with "external volume not found".
         """
         for handle, entry in (self.config.get("mounts") or {}).items():
             if not handle or not entry.get("source"):
                 continue
-            # Published under the FULL handle, because that is the name compose
-            # asks for: it resolves a volumes-block alias to `name:` and then
-            # matches that string against this list. A short alias in the list
-            # looks like a missing external volume and the project never starts.
-            name = handle
-            with self.lock:
-                existing = self.volumes.get(name)
-                vobj = dict(existing or {})
-                vobj["Name"] = name
-                vobj["Driver"] = "kbox-nfs"
-                vobj["Mountpoint"] = handle
-                vobj.setdefault("CreatedAt", rfc3339(time.time()))
-                vobj.setdefault("Labels", {})
-                vobj.setdefault("Scope", "local")
-                vobj["Options"] = {
-                    **(vobj.get("Options") or {}),
-                    "source": entry.get("source", ""),
-                    "options": entry.get("options", ""),
-                }
-                self.volumes[name] = vobj
+            names = [handle]
+            sub = (entry.get("sub") or "").strip("/")
+            if sub:
+                names.append(f"{handle}/{sub}")
+            for name in names:
+                with self.lock:
+                    existing = self.volumes.get(name)
+                    vobj = dict(existing or {})
+                    vobj["Name"] = name
+                    vobj["Driver"] = "kbox-nfs"
+                    vobj["Mountpoint"] = name
+                    vobj.setdefault("CreatedAt", rfc3339(time.time()))
+                    vobj.setdefault("Labels", {})
+                    vobj.setdefault("Scope", "local")
+                    vobj["Options"] = {
+                        **(vobj.get("Options") or {}),
+                        "source": entry.get("source", ""),
+                        "options": entry.get("options", ""),
+                    }
+                    self.volumes[name] = vobj
 
     def nfs_volume(self, name):
         """A synthetic volume for an nfs:// source, or None.

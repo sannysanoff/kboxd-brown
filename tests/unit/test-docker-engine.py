@@ -942,6 +942,16 @@ class TestNfsPlacement(unittest.TestCase):
         self.assertIn("nfs://persist", listed)
         self.assertIn("nfs://common", listed)
 
+    def test_subtree_declared_by_sub_is_published_too(self):
+        # The system stack asks for `nfs://persist/persists/<pod>` — the pod's own
+        # home. compose accepts an external volume only if the list contains that
+        # exact string, and publishing just the bare handle left the agent stack
+        # dying with "external volume not found".
+        listed = set(self.engine.volumes)
+        self.assertIn("nfs://persist/persists/pod-0", listed)
+        # The bare handle is still published, for a container that wants it all.
+        self.assertIn("nfs://persist", listed)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
