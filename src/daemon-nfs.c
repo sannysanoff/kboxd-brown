@@ -36,6 +36,7 @@
 #include <time.h>
 
 #include "daemon.h"
+#include "kbox/nfs-fresh.h"
 #include "kbox/nfs-plan.h"
 
 /* LKL constants, spelled out to keep this file free of kernel headers. */
@@ -427,7 +428,26 @@ int kbox_daemon_nfs_bind_container(const struct kbox_sysnrs *s,
             }
         }
 
-        ret = kbox_lkl_mount(s, src, dst, NULL, KBOX_MS_BIND, NULL);
+        /* Bind, retrying briefly while a just-created entry is still invisible.
+         * mkdir answered success but the client's attribute cache has not
+         * confirmed it, so the immediate lookup fails ESTALE/EIO. The same bind
+         * a second later succeeds, which is why the FIRST container of a stack
+         * died on `chown -R` over a named volume while later ones worked. */
+        ret = -1;
+        for (int attempt = 0; attempt < 6; attempt++) {
+            ret = kbox_lkl_mount(s, src, dst, NULL, KBOX_MS_BIND, NULL);
+            if (ret >= 0)
+                break;
+            if (!kbox_nfs_should_retry_bind((int) -ret))
+                break;
+            if (attempt == 5)
+                break;
+            struct timespec ts;
+            long ms = kbox_nfs_bind_delay_ms(attempt);
+            ts.tv_sec = ms / 1000;
+            ts.tv_nsec = (ms % 1000) * 1000000L;
+            nanosleep(&ts, NULL);
+        }
         if (ret < 0) {
             snprintf(err, err_size, "bind %s -> %s failed: %s", src,
                      b->guest_path, kbox_err_text(ret));
