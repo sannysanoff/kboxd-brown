@@ -45,6 +45,7 @@ SRCS     = $(SRC_DIR)/main.c \
            $(SRC_DIR)/daemon-nfs.c \
            $(SRC_DIR)/jsonreq.c \
            $(SRC_DIR)/resolv.c \
+           $(SRC_DIR)/nfs-plan.c \
            $(SRC_DIR)/daemon.c \
            $(SRC_DIR)/web-telemetry.c \
            $(SRC_DIR)/web-events.c \

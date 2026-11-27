@@ -36,6 +36,7 @@
 #include <time.h>
 
 #include "daemon.h"
+#include "kbox/nfs-plan.h"
 
 /* LKL constants, spelled out to keep this file free of kernel headers. */
 #define KBOX_MS_BIND 0x1000
@@ -319,6 +320,26 @@ int kbox_daemon_nfs_mount_all(const struct kbox_sysnrs *s,
     return 0;
 }
 
+/* True when path exists on the export as a regular file.
+ *
+ * A bind of a single file must not have its source or destination created as a
+ * directory: compose files bind config files (a ClickHouse settings fragment, a
+ * prometheus.yml), and creating the destination as a directory makes the bind
+ * fail with "Not a directory" while the source looks perfectly fine.
+ */
+static int nfs_source_is_file(const struct kbox_sysnrs *s, const char *path)
+{
+    struct kbox_lkl_stat st;
+#ifdef AT_FDCWD_LINUX
+    const int at_fdcwd = AT_FDCWD_LINUX;
+#else
+    const int at_fdcwd = -100;
+#endif
+    if (kbox_lkl_newfstatat(s, at_fdcwd, path, &st, 0) != 0)
+        return 0;
+    return (st.st_mode & 0170000u) == 0100000u;
+}
+
 /* Bind the subtree a container asked for. Called with the container's mount
  * namespace already unshared and its rootfs mounted via overlayfs, before
  * chroot, so paths are LKL-root paths of the form <rootfs><destination>.
@@ -372,16 +393,27 @@ int kbox_daemon_nfs_bind_container(const struct kbox_sysnrs *s,
             snprintf(src + used, sizeof(src) - used, "%s", subpath);
         }
 
-        /* Create the requested subtree on the export if it is missing. */
-        lkl_mkdir_p_daemon(s, src, 0755);
-
+        /* Create the requested subtree on the export when it is missing, but
+         * never turn a FILE into a directory: a compose file binds single files
+         * such as clickhouse-prometheus.xml, and creating the destination as a
+         * directory makes the bind fail with "Not a directory" even though the
+         * source is a regular file. */
         if ((size_t) snprintf(dst, sizeof(dst), "%s%s", rootfs,
                               b->guest_path) >= sizeof(dst)) {
             snprintf(err, err_size, "destination path too long: %s",
                      b->guest_path);
             return -1;
         }
-        lkl_mkdir_p_daemon(s, dst, 0755);
+        {
+            char src_mkdir[KBOX_MAX_PATH];
+            char dst_mkdir[KBOX_MAX_PATH];
+            kbox_nfs_bind_plan(nfs_source_is_file(s, src), src, dst, src_mkdir,
+                               sizeof(src_mkdir), dst_mkdir, sizeof(dst_mkdir));
+            if (src_mkdir[0])
+                lkl_mkdir_p_daemon(s, src_mkdir, 0755);
+            if (dst_mkdir[0])
+                lkl_mkdir_p_daemon(s, dst_mkdir, 0755);
+        }
 
         ret = kbox_lkl_mount(s, src, dst, NULL, KBOX_MS_BIND, NULL);
         if (ret < 0) {

@@ -97,6 +97,7 @@ extern void test_mount_init(void);
 extern void test_cli_init(void);
 extern void test_daemon_json_init(void);
 extern void test_daemon_resolv_init(void);
+extern void test_nfs_plan_init(void);
 extern void test_identity_init(void);
 extern void test_vcred_init(void);
 extern void test_syscall_nr_init(void);
@@ -132,6 +133,7 @@ int main(int argc, char *argv[])
     test_cli_init();
     test_daemon_json_init();
     test_daemon_resolv_init();
+    test_nfs_plan_init();
     test_identity_init();
     test_vcred_init();
     test_syscall_nr_init();
