@@ -9,6 +9,7 @@ Docker Compose v5.x) over TCP (--host 0.0.0.0:2375) and/or Unix socket.
 import argparse
 import base64
 import faulthandler
+import glob
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
@@ -18,10 +19,12 @@ import platform
 import queue
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
 import socketserver
+import stat
 import struct
 import sys
 import tarfile
@@ -262,6 +265,13 @@ def load_kbox_config(config_path=None):
                         cfg["manifests_dir"] = os.path.abspath(os.path.expanduser(val))
                 elif section == "storage" and key == "images":
                     cfg["images_driver"] = "hostfs" if val == "hostfs" else "copy"
+                elif section == "storage" and key in ("ephemeral_root",
+                                                      "ephemeral-root"):
+                    # Where the daemon keeps a container's writable overlay
+                    # layer; the builder reads it to snapshot a RUN step.
+                    if val:
+                        cfg["ephemeral_root"] = os.path.abspath(
+                            os.path.expanduser(val))
     if not cfg["gateway"]:
         cfg["gateway"] = _derive_gateway_ip(cfg["start_ip"])
     return cfg
@@ -480,6 +490,8 @@ class ImageStore:
                 return self.tags[short]
             # Match by image ID prefix
             clean = ref.removeprefix("sha256:")
+            if os.path.exists(self.manifest_path("sha256:" + clean)):
+                return "sha256:" + clean
             for k, iid in self.tags.items():
                 if iid == ref or iid.removeprefix("sha256:").startswith(clean):
                     return iid
@@ -516,6 +528,56 @@ class ImageStore:
             # Overlay lowerdir order is top-first, the manifest is base-first.
             msg["layers"] = [self.layer_path(d) for d in reversed(layers)]
         self.rpc.call(msg)
+
+    def commit_container(self, container_id, ephemeral_root):
+        """Snapshot a container's writable layer as a new image layer.
+
+        The daemon mounts every container's rootfs over an upper layer on the
+        host, so the changed files are already on this filesystem and the
+        snapshot is a translated copy, not a walk through the guest kernel.
+        """
+        upper = os.path.join(ephemeral_root, container_id, "upper")
+        if not os.path.isdir(upper):
+            raise BuildError("container %s has no writable layer at %s"
+                             % (container_id, upper))
+        digest = secrets.token_hex(32)
+        dest = os.path.join(self.layers_dir, digest)
+        stage = "%s.stage-%d" % (dest, os.getpid())
+        shutil.rmtree(stage, ignore_errors=True)
+        os.makedirs(stage, exist_ok=True)
+        _copy_upper_tree(upper, stage)
+        os.replace(stage, dest)
+        return "sha256:" + digest
+
+    def register_built_image(self, ref, layers, config):
+        """Record a built image: manifest, metadata, and optionally a tag."""
+        key = json.dumps({"layers": list(layers), "config": config},
+                         sort_keys=True, separators=(",", ":"))
+        img_id = "sha256:" + hashlib.sha256(key.encode()).hexdigest()
+        short = img_id.removeprefix("sha256:")
+        dest = os.path.join(self.images_dir, short)
+        os.makedirs(dest, exist_ok=True)
+        meta = {
+            "id": img_id,
+            "created": int(time.time()),
+            "size": 0,
+            "architecture": self._target_arch(),
+            "os": "linux",
+            "config": config,
+            "layers": list(layers),
+        }
+        self.save_manifest(img_id, meta)
+        with open(os.path.join(dest, "meta.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=2)
+        if ref:
+            norm, _, _ = self.normalize_ref(ref)
+            short_norm = re.sub(r"^(docker\.io/)?(library/)?", "", norm)
+            with self.lock:
+                self.tags[norm] = img_id
+                self.tags[short_norm] = img_id
+                self._save_tags()
+        self.ensure_imported(img_id, layers)
+        return img_id
 
     def list_images(self):
         res = []
@@ -1098,6 +1160,490 @@ class ImageStore:
         return img_id
 
 
+# Same default the daemon uses; both sides must name one directory.
+DEFAULT_EPHEMERAL_ROOT = "/tmp/.kboxd/ephemeral"
+
+
+class BuildError(Exception):
+    """A build step that failed; the message goes to the client as is."""
+
+
+def _xattr_get(path, name):
+    try:
+        return os.getxattr(path, name, follow_symlinks=False)
+    except (OSError, AttributeError):
+        return None
+
+
+def _xattr_set(path, name):
+    try:
+        os.setxattr(path, name, b"y", follow_symlinks=False)
+    except (OSError, AttributeError):
+        pass
+
+
+def _write_whiteout(path):
+    """Mark a deleted entry the way the layer unpacker does.
+
+    overlayfs reads a deletion from a lower layer as an empty file carrying
+    user.overlay.whiteout, which is exactly what _extract_layer produces for a
+    .wh. marker in a pulled layer, so a committed layer and a pulled one are
+    interchangeable.
+    """
+    try:
+        with open(path, "wb"):
+            pass
+        _xattr_set(path, "user.overlay.whiteout")
+    except OSError:
+        pass
+
+
+def _copy_upper_tree(src, dst):
+    """Turn a container's writable overlay layer into an image layer.
+
+    The upper layer records a deletion as a character device 0/0 and an opaque
+    directory as a user.overlay.opaque xattr; a layer that will sit below the
+    next mount has to carry both in the form overlayfs recognises there.
+    """
+    st = os.lstat(src)
+    if stat.S_ISCHR(st.st_mode) and st.st_rdev == 0:
+        _write_whiteout(dst)
+        return
+    if stat.S_ISLNK(st.st_mode):
+        os.symlink(os.readlink(src), dst)
+        return
+    if stat.S_ISDIR(st.st_mode):
+        os.makedirs(dst, exist_ok=True)
+        if _xattr_get(src, "user.overlay.opaque") is not None:
+            _xattr_set(dst, "user.overlay.opaque")
+        for name in os.listdir(src):
+            _copy_upper_tree(os.path.join(src, name), os.path.join(dst, name))
+        os.chmod(dst, stat.S_IMODE(st.st_mode) | stat.S_IWUSR | stat.S_IXUSR)
+        return
+    if stat.S_ISREG(st.st_mode):
+        shutil.copyfile(src, dst)
+        os.chmod(dst, stat.S_IMODE(st.st_mode))
+        return
+    # A socket or a fifo carries no filesystem content.
+
+
+def _layer_whiteout(path):
+    return _xattr_get(path, "user.overlay.whiteout") is not None
+
+
+def _apply_layer_to(src, dst):
+    """Overlay one layer directory onto a plain tree, whiteouts included."""
+    for name in os.listdir(src):
+        s = os.path.join(src, name)
+        d = os.path.join(dst, name)
+        if name == ".wh..wh..opq":
+            continue
+        if name.startswith(".wh."):
+            victim = os.path.join(dst, name[4:])
+            if os.path.isdir(victim) and not os.path.islink(victim):
+                shutil.rmtree(victim, ignore_errors=True)
+            elif os.path.lexists(victim):
+                os.unlink(victim)
+            continue
+        st = os.lstat(s)
+        if stat.S_ISREG(st.st_mode) and _layer_whiteout(s):
+            victim = d
+            if os.path.isdir(victim) and not os.path.islink(victim):
+                shutil.rmtree(victim, ignore_errors=True)
+            elif os.path.lexists(victim):
+                os.unlink(victim)
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            os.makedirs(d, exist_ok=True)
+            _apply_layer_to(s, d)
+            continue
+        if os.path.lexists(d):
+            if os.path.isdir(d) and not os.path.islink(d):
+                shutil.rmtree(d, ignore_errors=True)
+            else:
+                os.unlink(d)
+        if stat.S_ISLNK(st.st_mode):
+            os.symlink(os.readlink(s), d)
+        elif stat.S_ISREG(st.st_mode):
+            shutil.copyfile(s, d)
+            os.chmod(d, stat.S_IMODE(st.st_mode))
+
+
+def _parse_dockerfile(text):
+    """Instructions of a Dockerfile, continuations joined, comments dropped."""
+    joined = []
+    buf = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not buf and (not line or line.startswith("#")):
+            continue
+        if line.endswith("\\"):
+            buf += line[:-1].strip() + " "
+            continue
+        buf += line
+        joined.append(buf.strip())
+        buf = ""
+    if buf.strip():
+        joined.append(buf.strip())
+    out = []
+    for line in joined:
+        parts = line.split(None, 1)
+        out.append((parts[0].upper(), parts[1] if len(parts) > 1 else ""))
+    return out
+
+
+def _json_or_shell(arg):
+    arg = arg.strip()
+    if arg.startswith("["):
+        try:
+            val = json.loads(arg)
+            if isinstance(val, list):
+                return [str(v) for v in val]
+        except ValueError:
+            pass
+    return None
+
+
+def _demux_container_log(data):
+    """Container output carries 8-byte frame headers; the build shows text."""
+    out = bytearray()
+    i = 0
+    total = len(data)
+    while i + 8 <= total:
+        size = struct.unpack(">I", data[i + 4:i + 8])[0]
+        if size > total - i - 8:
+            break
+        out += data[i + 8:i + 8 + size]
+        i += 8 + size
+    if not out and data:
+        return data.decode("utf-8", "replace")
+    return out.decode("utf-8", "replace")
+
+
+class ImageBuilder:
+    """The classic builder: every instruction becomes a layer of one image.
+
+    BuildKit ships its own daemon and is out of reach here; this executes the
+    same Dockerfile one step at a time against the kbox daemon and snapshots the
+    container's writable layer after each step that can change files.
+    """
+
+    def __init__(self, engine, progress=None, buildargs=None):
+        self.eng = engine
+        self.store = engine.images
+        self.progress = progress or (lambda _obj: None)
+        self.buildargs = dict(buildargs or {})
+        self.ephemeral_root = getattr(engine, "ephemeral_root",
+                                      DEFAULT_EPHEMERAL_ROOT)
+        self.stages = {}
+        self.stage_list = []
+        self.shell = ["/bin/sh", "-c"]
+
+    def build(self, context_dir, dockerfile, tag):
+        steps = _parse_dockerfile(dockerfile)
+        if not steps:
+            raise BuildError("the Dockerfile is empty")
+        stage = None
+        for ins, arg in steps:
+            if ins == "FROM":
+                stage = self._from(arg, context_dir)
+                continue
+            if stage is None:
+                raise BuildError("the Dockerfile does not start with FROM")
+            self.progress({"stream": "%s %s\n" % (ins, arg)})
+            self._step(stage, ins, arg, context_dir)
+        if stage is None:
+            raise BuildError("the Dockerfile does not start with FROM")
+        img_id = self.store.register_built_image(tag, stage["layers"],
+                                                 stage["config"])
+        if tag:
+            self.progress({"stream": "Successfully tagged %s\n" % tag})
+        self.progress({"aux": {"ID": img_id}})
+        self._cleanup()
+        return img_id
+
+    def _cleanup(self):
+        for stage in self.stage_list:
+            tree = stage.get("_merged")
+            if tree:
+                shutil.rmtree(tree, ignore_errors=True)
+
+    def _from(self, arg, context_dir):
+        argv = [a for a in shlex.split(arg) if not a.startswith("--")]
+        if not argv:
+            raise BuildError("FROM without an image")
+        ref = argv[0]
+        name = None
+        if len(argv) >= 3 and argv[1].upper() == "AS":
+            name = argv[2].lower()
+        base = self.stages.get(ref.lower())
+        if base is not None:
+            layers = list(base["layers"])
+            config = dict(base["config"])
+        else:
+            iid = self.store.resolve(ref)
+            if not iid:
+                self.progress({"status": "Pulling %s" % ref})
+                iid = self.store.pull(ref)
+            meta = self.store.get_meta(iid) or {}
+            manifest = self.store.load_manifest(iid) or {}
+            layers = list(manifest.get("layers") or meta.get("layers") or [])
+            config = dict(meta.get("config") or {})
+            # A build stage starts from the filesystem, not the entrypoint:
+            # carrying the parent's CMD would run it in every later step.
+            config.pop("Cmd", None)
+            config.pop("Entrypoint", None)
+        stage = {"layers": layers, "config": config, "name": name,
+                 "_merged": None}
+        self.stage_list.append(stage)
+        if name:
+            self.stages[name] = stage
+        self.stages[str(len(self.stage_list))] = stage
+        return stage
+
+    def _replace_vars(self, text, stage):
+        def sub(match):
+            key = match.group(1) or match.group(2)
+            if key in self.buildargs:
+                return self.buildargs[key]
+            env = self._env_map(stage["config"]).get(key)
+            return env if env is not None else match.group(0)
+
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+                      sub, text)
+
+    @staticmethod
+    def _env_map(config):
+        out = {}
+        for item in config.get("Env") or []:
+            key, _, val = item.partition("=")
+            out[key] = val
+        return out
+
+    def _set_env(self, config, key, val):
+        env = [e for e in (config.get("Env") or [])
+               if e.partition("=")[0] != key]
+        env.append("%s=%s" % (key, val))
+        config["Env"] = env
+
+    def _step(self, stage, ins, arg, context_dir):
+        config = stage["config"]
+        if ins == "ENV":
+            for part in shlex.split(arg):
+                key, sep, val = part.partition("=")
+                if not sep:
+                    key, _, val = arg.partition(" ")
+                    self._set_env(config, key, val.strip())
+                    break
+                self._set_env(config, key, self._replace_vars(val, stage))
+            return
+        if ins == "ARG":
+            for part in shlex.split(arg):
+                key, sep, val = part.partition("=")
+                if key and sep and key not in self.buildargs:
+                    self.buildargs[key] = self._replace_vars(val, stage)
+            return
+        if ins == "WORKDIR":
+            path = self._replace_vars(arg.strip(), stage)
+            workdir = path if path.startswith("/") else os.path.join(
+                config.get("WorkingDir") or "/", path)
+            config["WorkingDir"] = os.path.normpath(workdir)
+            self._mkdir_layer(stage, config["WorkingDir"])
+            return
+        if ins == "RUN":
+            cmd = self._replace_vars(arg, stage)
+            self._run(stage, cmd)
+            return
+        if ins in ("COPY", "ADD"):
+            self._copy(stage, arg, context_dir, extract=(ins == "ADD"))
+            return
+        if ins == "USER":
+            config["User"] = self._replace_vars(arg.strip(), stage)
+            return
+        if ins in ("CMD", "ENTRYPOINT"):
+            val = _json_or_shell(arg)
+            if val is None:
+                val = [self.shell[0], self.shell[1], arg] if self.shell[1] \
+                    else [self.shell[0], "-c", arg]
+            config["Cmd" if ins == "CMD" else "Entrypoint"] = val
+            return
+        if ins == "SHELL":
+            val = _json_or_shell(arg) or []
+            if val:
+                self.shell = val
+            return
+        if ins == "EXPOSE":
+            ports = config.setdefault("ExposedPorts", {})
+            for port in arg.split():
+                port = port.split("/")[0]
+                ports["%s/tcp" % port] = {}
+            return
+        if ins in ("LABEL", "MAINTAINER"):
+            labels = config.setdefault("Labels", {})
+            if ins == "MAINTAINER":
+                labels["maintainer"] = arg.strip()
+                return
+            for part in shlex.split(arg):
+                key, sep, val = part.partition("=")
+                if sep:
+                    labels[key] = self._replace_vars(val, stage)
+            return
+        if ins == "VOLUME":
+            vols = config.setdefault("Volumes", {})
+            val = _json_or_shell(arg)
+            for path in (val or arg.split()):
+                vols[path] = {}
+            return
+        # HEALTHCHECK, STOPSIGNAL, ONBUILD and unknown instructions describe
+        # runtime behaviour kbox does not model; they do not change files.
+
+    def _stage_dir(self):
+        path = os.path.join(self.store.state_dir,
+                            "build-stage-" + secrets.token_hex(8))
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _commit_dir(self, stage_dir):
+        digest = secrets.token_hex(32)
+        dest = os.path.join(self.store.layers_dir, digest)
+        os.replace(stage_dir, dest)
+        return "sha256:" + digest
+
+    def _mkdir_layer(self, stage, path):
+        stage_dir = self._stage_dir()
+        try:
+            os.makedirs(os.path.join(stage_dir, path.lstrip("/")), exist_ok=True)
+        except OSError as exc:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            raise BuildError("WORKDIR %s: %s" % (path, exc))
+        stage["layers"].append(self._commit_dir(stage_dir))
+
+    def _materialize(self, stage):
+        if stage.get("_merged"):
+            return stage["_merged"]
+        tree = os.path.join(self.store.state_dir,
+                            "build-tree-" + secrets.token_hex(8))
+        os.makedirs(tree, exist_ok=True)
+        for digest in stage["layers"]:
+            _apply_layer_to(self.store.layer_path(digest), tree)
+        stage["_merged"] = tree
+        return tree
+
+    def _copy(self, stage, arg, context_dir, extract=False):
+        parts = shlex.split(self._replace_vars(arg, stage))
+        flags = [p for p in parts if p.startswith("--")]
+        rest = [p for p in parts if not p.startswith("--")]
+        if len(rest) < 2:
+            raise BuildError("COPY takes a source and a destination")
+        sources, dest = rest[:-1], rest[-1]
+        source_root = context_dir
+        for flag in flags:
+            if flag.startswith("--from="):
+                base = self.stages.get(flag[len("--from="):].lower())
+                if base is None:
+                    raise BuildError("COPY --from=%s: no such stage" % flag)
+                source_root = self._materialize(base)
+        if not dest.startswith("/"):
+            dest = os.path.join(stage["config"].get("WorkingDir") or "/", dest)
+        dest = os.path.normpath(dest)
+        into_dir = dest.endswith("/") or len(sources) > 1
+        stage_dir = self._stage_dir()
+        try:
+            for src in sources:
+                # A path from another stage is absolute inside that stage;
+                # a context path is relative to the context directory.
+                rel = src.lstrip("/") if source_root is not context_dir else src
+                if any(ch in rel for ch in "*?["):
+                    matches = sorted(glob.glob(os.path.join(source_root, rel)))
+                    if not matches:
+                        raise BuildError("COPY: %s matched nothing" % src)
+                else:
+                    path = os.path.join(source_root, rel)
+                    if not os.path.exists(path):
+                        raise BuildError("COPY: %s does not exist" % src)
+                    matches = [path]
+                for match in matches:
+                    target_root = os.path.join(stage_dir, dest.lstrip("/"))
+                    if extract and source_root is context_dir and \
+                            tarfile.is_tarfile(match):
+                        # ADD unpacks a local archive into the destination.
+                        os.makedirs(target_root, exist_ok=True)
+                        with tarfile.open(match) as tf:
+                            try:
+                                tf.extractall(target_root, filter="tar")
+                            except TypeError:
+                                tf.extractall(target_root)
+                        continue
+                    if os.path.isdir(match) and not os.path.islink(match):
+                        # A directory copies its contents, not itself.
+                        os.makedirs(target_root, exist_ok=True)
+                        for name in os.listdir(match):
+                            self._copy_entry(os.path.join(match, name),
+                                             os.path.join(target_root, name))
+                    elif into_dir or os.path.isdir(target_root):
+                        os.makedirs(target_root, exist_ok=True)
+                        self._copy_entry(match, os.path.join(
+                            target_root, os.path.basename(match)))
+                    else:
+                        self._copy_entry(match, target_root)
+        except Exception:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            raise
+        stage["layers"].append(self._commit_dir(stage_dir))
+
+    @staticmethod
+    def _copy_entry(src, dst):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.isdir(src) and not os.path.islink(src):
+            shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+        else:
+            if os.path.lexists(dst):
+                os.unlink(dst)
+            if os.path.islink(src):
+                os.symlink(os.readlink(src), dst)
+            else:
+                shutil.copy2(src, dst)
+
+    def _run(self, stage, command):
+        image_id = self.store.register_built_image(None, stage["layers"],
+                                                   stage["config"])
+        body = {
+            "Image": image_id,
+            "Cmd": [self.shell[0], "-c", command] if len(self.shell) > 1
+            else list(self.shell) + [command],
+            "WorkingDir": stage["config"].get("WorkingDir") or "/",
+        }
+        container = self.eng.create_container(None, body)
+        self.eng.start_container(container)
+        try:
+            result = self.eng.rpc.call({"op": "container_wait",
+                                        "id": container["id"]})
+            code = int(result.get("exit_code", 0) or 0)
+        except Exception as exc:
+            code = 137
+            self.progress({"stream": "wait failed: %s\n" % exc})
+        output = ""
+        log_path = container.get("log_path")
+        if log_path and os.path.exists(log_path):
+            try:
+                with open(log_path, "rb") as fh:
+                    output = _demux_container_log(fh.read())
+            except OSError:
+                output = ""
+        if output:
+            self.progress({"stream": output})
+        if code != 0:
+            self.eng.rpc.call({"op": "container_rm", "id": container["id"],
+                               "force": True})
+            raise BuildError("the command '/bin/sh -c %s' returned a non-zero "
+                             "code: %d" % (command, code))
+        layer = self.store.commit_container(container["id"], self.ephemeral_root)
+        stage["layers"].append(layer)
+        stage["_merged"] = None
+        self.eng.rpc.call({"op": "container_rm", "id": container["id"],
+                           "force": True})
+
+
 class DockerEngineState:
     """In-memory state for containers, networks, and persistent volumes."""
 
@@ -1106,6 +1652,8 @@ class DockerEngineState:
         self.state_dir = state_dir
         self.path_maps = path_maps or []
         self.config = config if config is not None else load_kbox_config(config_path)
+        self.ephemeral_root = self.config.get("ephemeral_root",
+                                              DEFAULT_EPHEMERAL_ROOT)
         self.start_ip = self.config.get("start_ip", DEFAULT_START_IP)
         self.gateway_ip = self.config.get("gateway") or _derive_gateway_ip(self.start_ip)
         self.subnet_cidr = str(ipaddress.IPv4Network(f"{self.gateway_ip}/16", strict=False))
@@ -2544,6 +3092,10 @@ class DockerHandler(BaseHTTPRequestHandler):
         eng = self.server.engine
         path, qs = self._parse_url()
 
+        if path == "/build":
+            self._handle_build(qs)
+            return
+
         if path == "/images/create":
             from_img = (qs.get("fromImage") or [""])[0]
             tag = (qs.get("tag") or ["latest"])[0]
@@ -2849,6 +3401,66 @@ class DockerHandler(BaseHTTPRequestHandler):
             return
 
         self.send_json(404, {"message": f"unsupported POST {path}"})
+
+    def _handle_build(self, qs):
+        """POST /build: the classic builder, one Dockerfile instruction at a time.
+
+        BuildKit would need its own daemon and a gRPC session; the docker CLI
+        falls back to this protocol with DOCKER_BUILDKIT=0, and it is what the
+        image store already supports.
+        """
+        eng = self.server.engine
+        tags = qs.get("t") or []
+        dockerfile = (qs.get("dockerfile") or ["Dockerfile"])[0] or "Dockerfile"
+        buildargs = {}
+        for raw in qs.get("buildargs") or []:
+            try:
+                buildargs.update(json.loads(raw))
+            except ValueError:
+                pass
+        body = self._read_body()
+        ctx_dir = os.path.join(eng.state_dir,
+                               "build-ctx-" + secrets.token_hex(8))
+        os.makedirs(ctx_dir, exist_ok=True)
+        try:
+            payload = body
+            if payload[:2] == b"\x1f\x8b":
+                import gzip
+                payload = gzip.decompress(payload)
+            import io
+            with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as tf:
+                try:
+                    tf.extractall(ctx_dir, filter="tar")
+                except TypeError:
+                    tf.extractall(ctx_dir)
+            dockerfile_path = os.path.join(ctx_dir, dockerfile)
+            if not os.path.isfile(dockerfile_path):
+                raise BuildError("Cannot locate specified Dockerfile: %s"
+                                 % dockerfile)
+            with open(dockerfile_path, "r", errors="replace") as fh:
+                text = fh.read()
+            self._begin_chunked(200, "application/json")
+            try:
+                def emit(obj):
+                    self._write_chunk(json.dumps(obj) + "\n")
+
+                builder = ImageBuilder(eng, progress=emit,
+                                       buildargs=buildargs)
+                img_id = builder.build(ctx_dir, text, tags[0] if tags else None)
+                for extra in tags[1:]:
+                    if eng.images.tag(img_id, extra):
+                        emit({"stream": "Successfully tagged %s\n" % extra})
+                emit({"stream": "Successfully built %s\n"
+                      % img_id.removeprefix("sha256:")[:12]})
+            except Exception as exc:
+                self._write_chunk(json.dumps({
+                    "errorDetail": {"message": str(exc)},
+                    "error": str(exc)}) + "\n")
+            self._end_chunked()
+        except Exception as exc:
+            self.send_json(500, {"message": str(exc)})
+        finally:
+            shutil.rmtree(ctx_dir, ignore_errors=True)
 
     def do_PUT(self):
         eng = self.server.engine
