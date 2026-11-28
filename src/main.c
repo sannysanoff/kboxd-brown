@@ -5,6 +5,7 @@
 #include <execinfo.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -58,8 +59,25 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     _exit(139);
 }
 
+/* A daemon that leaves without a message tells us nothing about where it
+ * decided to go. With KBOX_EXIT_TRACE set, print the stack that called exit().
+ */
+static void exit_trace(void)
+{
+    void *frames[64];
+    char line[64];
+    int n = backtrace(frames, 64);
+    int len = snprintf(line, sizeof(line), "kbox: exit trace pid=%d\n",
+                       (int) getpid());
+    if (len > 0)
+        (void) write(STDERR_FILENO, line, (size_t) len);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+}
+
 int main(int argc, char *argv[])
 {
+    if (getenv("KBOX_EXIT_TRACE"))
+        atexit(exit_trace);
     struct sigaction sa;
     struct kbox_image_args args;
 

@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1759,6 +1760,48 @@ static struct kbox_dispatch ioctl_fionbio(
 #define SIOCGIFNAME 0x8910
 #endif
 
+/* ioctls whose argument is a struct ifreq. LKL copies that argument with
+ * copy_from_user, and a guest pointer is not mapped in the daemon's address
+ * space, so the copy faults (or silently reads whatever the daemon has at that
+ * address). Stage the request through guest memory instead: the guest fills a
+ * host buffer here, LKL works on the buffer, and the answer goes back the same
+ * way. `ip addr` reaches this with SIOCGIFMAP right after SIOCGIFADDR.
+ */
+static int ioctl_arg_is_ifreq(long cmd)
+{
+    switch (cmd) {
+    case SIOCGIFADDR:
+    case SIOCSIFADDR:
+    case SIOCGIFDSTADDR:
+    case SIOCSIFDSTADDR:
+    case SIOCGIFBRDADDR:
+    case SIOCSIFBRDADDR:
+    case SIOCGIFNETMASK:
+    case SIOCSIFNETMASK:
+    case SIOCGIFHWADDR:
+    case SIOCSIFHWADDR:
+    case SIOCGIFMTU:
+    case SIOCSIFMTU:
+    case SIOCGIFMAP:
+    case SIOCSIFMAP:
+    case SIOCGIFFLAGS:
+    case SIOCSIFFLAGS:
+    case SIOCGIFMETRIC:
+    case SIOCSIFMETRIC:
+    case SIOCGIFMEM:
+    case SIOCSIFMEM:
+    case SIOCGIFTXQLEN:
+    case SIOCSIFTXQLEN:
+    case SIOCGIFINDEX:
+    case SIOCGIFNAME:
+    case SIOCSIFNAME:
+    case SIOCDIFADDR:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
                                    struct kbox_supervisor_ctx *ctx)
 {
@@ -1870,6 +1913,21 @@ struct kbox_dispatch forward_ioctl(const struct kbox_syscall_request *req,
             return kbox_dispatch_value(0);
         }
         return kbox_dispatch_value(0);
+    }
+
+    if (ioctl_arg_is_ifreq(cmd)) {
+        struct ifreq ifr;
+        pid_t pid = kbox_syscall_request_pid(req);
+        uint64_t arg_ptr = kbox_syscall_request_arg(req, 2);
+
+        if (arg_ptr == 0 ||
+            guest_mem_read(ctx, pid, arg_ptr, &ifr, sizeof(ifr)) < 0)
+            return kbox_dispatch_errno(EFAULT);
+        long iret = kbox_lkl_ioctl(ctx->sysnrs, lkl_fd, cmd, (long) &ifr);
+        if (iret == 0 &&
+            guest_mem_write(ctx, pid, arg_ptr, &ifr, sizeof(ifr)) < 0)
+            iret = -EFAULT;
+        return kbox_dispatch_from_lkl(iret);
     }
 
     long ret = kbox_lkl_ioctl(ctx->sysnrs, lkl_fd, cmd,

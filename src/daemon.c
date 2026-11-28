@@ -1355,6 +1355,23 @@ static void setup_gate_release(struct daemon_container *c)
     pthread_mutex_unlock(&g_setup_mu);
 }
 
+/* One line per stage of a container start: when a start dies without an error
+ * message the last line printed names the stage that killed it. */
+static void start_step(struct daemon_container *c, const char *step)
+{
+    if (g_verbose)
+        fprintf(stderr, "kboxd: start[%s] %s (pid=%d)\n", c->name, step,
+                (int) getpid());
+}
+
+/* Progress of one container launch, one line per stage: when a start dies
+ * without an error message, the last line names the stage it died in. */
+static void launch_step(const char *step)
+{
+    if (g_verbose)
+        fprintf(stderr, "kboxd: launch %s (pid=%d)\n", step, (int) getpid());
+}
+
 static void fail_container_start(struct daemon_container *c, const char *msg)
 {
     setup_gate_release(c);
@@ -1396,6 +1413,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
     const char *raw_cmd =
         (pe->cmd_count > 0 && pe->cmd && pe->cmd[0]) ? pe->cmd[0] : "/bin/sh";
     char resolved_cmd[PATH_MAX];
+    launch_step("resolve executable");
     if (resolve_cmd_path(sysnrs, pe, raw_cmd, resolved_cmd,
                          sizeof(resolved_cmd)) < 0) {
         snprintf(err_msg, sizeof(err_msg), "executable not found: %s", raw_cmd);
@@ -1406,6 +1424,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
     char *exec_argv[MAX_CMD_ARGS + 6];
     memset(exec_argv, 0, sizeof(exec_argv));
     int exec_memfd = -1, interp_memfd = -1;
+    launch_step("stage exec images");
     if (prepare_exec_memfds(sysnrs, pe, resolved_cmd, pe->cmd, pe->cmd_count,
                             exec_argv, MAX_CMD_ARGS + 5, &exec_memfd,
                             &interp_memfd, err_msg, sizeof(err_msg)) < 0) {
@@ -1429,6 +1448,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
         exec_envp[ei++] = default_path;
     exec_envp[ei] = NULL;
 
+    launch_step("create pipes");
     int sp[2] = {-1, -1};
     int out_p[2] = {-1, -1};
     int err_p[2] = {-1, -1};
@@ -1450,6 +1470,7 @@ static int launch_and_supervise_proc(const struct kbox_sysnrs *sysnrs,
         return -1;
     }
 
+    launch_step("open log file");
     int log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (log_fd < 0) {
         /* Without this file the container runs with its output going nowhere
@@ -1505,6 +1526,7 @@ stdin_ok:
     *hooks->exit_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     __atomic_store_n(hooks->exit_status, -1, __ATOMIC_RELEASE);
 
+    launch_step("fork");
     pthread_mutex_lock(&g_reap_lock);
     pid_t pid = fork();
     if (pid == 0) {
@@ -1559,6 +1581,8 @@ stdin_ok:
 
     if (pid > 0)
         *hooks->child_pid = pid;
+    if (g_verbose)
+        fprintf(stderr, "kboxd: launch forked child pid=%d\n", (int) pid);
     pthread_mutex_unlock(&g_reap_lock);
 
     if (devnull >= 0)
@@ -1587,8 +1611,11 @@ stdin_ok:
         return -1;
     }
 
+    launch_step("wait for seccomp listener");
     int listener_fd = kbox_supervisor_recv_fd(sp[0]);
     close(sp[0]);
+    if (g_verbose)
+        fprintf(stderr, "kboxd: launch listener fd=%d\n", listener_fd);
 
     if (listener_fd < 0) {
         kill(-pid, SIGKILL);
@@ -1627,18 +1654,30 @@ stdin_ok:
             close(log_fd);
     }
 
+    launch_step("report running");
     hooks->on_running(hooks->opaque);
 
-    struct kbox_fd_table fd_table;
+    /* Heap, not the worker's stack: the table is indexed by guest fd number and
+     * holds KBOX_FD_TABLE_MAX entries, which is several megabytes -- larger
+     * than the 8 MiB thread stack leaves for the rest of this frame. */
+    struct kbox_fd_table *fd_table = calloc(1, sizeof(*fd_table));
     struct kbox_supervisor_ctx ctx;
-    kbox_fd_table_init(&fd_table);
+    if (!fd_table) {
+        kill(-pid, SIGKILL);
+        if (has_log_thr)
+            pthread_join(log_thr, NULL);
+        close(listener_fd);
+        hooks->on_failed(hooks->opaque, "fd table allocation failed");
+        return -1;
+    }
+    kbox_fd_table_init(fd_table);
     for (int i = 0; i < 3; i++)
-        kbox_fd_table_insert_at(&fd_table, i, KBOX_LKL_FD_SHADOW_ONLY, 0);
+        kbox_fd_table_insert_at(fd_table, i, KBOX_LKL_FD_SHADOW_ONLY, 0);
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.sysnrs = sysnrs;
     ctx.host_nrs = g_host_nrs;
-    ctx.fd_table = &fd_table;
+    ctx.fd_table = fd_table;
     ctx.listener_fd = listener_fd;
     ctx.proc_self_fd_dirfd = -1;
     ctx.close_inotify_fd = -1;
@@ -1667,7 +1706,10 @@ stdin_ok:
     ctx.exit_notify_fd = *hooks->exit_efd;
     ctx.exit_status_ptr = hooks->exit_status;
 
+    launch_step("enter supervisor");
     int exit_code = kbox_supervise_ctx(&ctx);
+    if (g_verbose)
+        fprintf(stderr, "kboxd: launch supervisor returned %d\n", exit_code);
 
     /* The container's init exiting does not end the rest of its processes, and
      * once the supervisor has returned nobody is servicing their syscalls: they
@@ -1702,6 +1744,7 @@ stdin_ok:
         close(*hooks->exit_efd);
         *hooks->exit_efd = -1;
     }
+    free(fd_table);
 
     return (exit_code >= 0) ? exit_code : 137;
 }
@@ -1804,6 +1847,8 @@ static int host_rm_rf(const char *path)
  */
 static void *container_worker_thread(void *arg)
 {
+    struct daemon_container *wc = (struct daemon_container *) arg;
+    start_step(wc, "worker: begin");
     struct daemon_container *c = arg;
     const struct kbox_sysnrs *sysnrs = g_sysnrs;
     char cdir[128], upper[160], work[160], rootfs[160];
@@ -1987,6 +2032,7 @@ static void *container_worker_thread(void *arg)
      * veth was created leaves it behind, and starting the same container again
      * (compose retries one that is still "Created") asked for the same name and
      * got EEXIST, failing every container that followed. */
+    start_step(c, "net: veth");
     snprintf(c->host_if, sizeof(c->host_if), "veth%d",
              __atomic_add_fetch(&g_veth_seq, 1, __ATOMIC_SEQ_CST));
     int vrc =
@@ -2002,6 +2048,7 @@ static void *container_worker_thread(void *arg)
         return NULL;
     }
 
+    start_step(c, "net: veth ok, configure lo/eth0");
     const char *gw_ip = kbox_daemon_net_gateway_ip();
     kbox_net_configure_ipv4(sysnrs, "lo", "127.0.0.1", "255.0.0.0", NULL);
     if (kbox_net_configure_ipv4(sysnrs, "eth0", c->ip, KBOX_DAEMON_HOST_MASK,
@@ -2017,12 +2064,14 @@ static void *container_worker_thread(void *arg)
     }
 
     const char *hn = c->hostname[0] ? c->hostname : c->name;
+    start_step(c, "uts: hostname");
     kbox_lkl_sethostname(sysnrs, hn, (long) strlen(hn));
 
     char etc_dir[256], resolv_p[256], hosts_p[256];
     snprintf(etc_dir, sizeof(etc_dir), "%s/etc", rootfs);
     lkl_mkdir_p(sysnrs, etc_dir, 0755);
 
+    start_step(c, "etc: resolv.conf");
     snprintf(resolv_p, sizeof(resolv_p), "%s/etc/resolv.conf", rootfs);
     long rfd = kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, resolv_p,
                                0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
@@ -2055,6 +2104,7 @@ static void *container_worker_thread(void *arg)
         kbox_lkl_close(sysnrs, rfd);
     }
 
+    start_step(c, "etc: hosts");
     snprintf(hosts_p, sizeof(hosts_p), "%s/etc/hosts", rootfs);
     long hfd = kbox_lkl_openat(sysnrs, AT_FDCWD_LINUX, hosts_p,
                                0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
@@ -2073,6 +2123,7 @@ static void *container_worker_thread(void *arg)
      * export lives outside the container's rootfs; the mount namespace is
      * already private to this container.
      */
+    start_step(c, "nfs: bind volumes");
     if (g_config.nfs_count > 0 && c->bind_count > 0) {
         char nfs_err[256] = {0};
         if (kbox_daemon_nfs_bind_container(sysnrs, &g_config, rootfs, c->binds,
@@ -2090,6 +2141,7 @@ static void *container_worker_thread(void *arg)
         }
     }
 
+    start_step(c, "fs: chroot");
     if (kbox_lkl_chroot(sysnrs, rootfs) < 0 ||
         kbox_lkl_chdir(sysnrs, "/") < 0) {
         if (mnt_fd >= 0)
@@ -2159,7 +2211,9 @@ static void *container_worker_thread(void *arg)
         .on_running = cont_on_running,
         .on_failed = cont_on_failed,
     };
+    start_step(c, "proc: launch and supervise");
     int exit_code = launch_and_supervise_proc(sysnrs, &pe, c->log_path, &hooks);
+    start_step(c, "proc: supervise returned");
     setup_gate_release(c);
 
     pthread_mutex_lock(&c->lock);
